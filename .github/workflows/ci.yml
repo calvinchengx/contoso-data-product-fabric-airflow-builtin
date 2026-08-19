@@ -1,0 +1,56 @@
+# The product's own tests: no platform, no emulator, no credentials.
+#
+# This cell targets Fabric's BUILT-IN Airflow, whose sidecar the platform
+# builds from this repo's pyproject.toml. So the dependency declarations are
+# not documentation here, they are the install manifest, and a test suite that
+# stops running is how a deployment literal creeps back into the DAG.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.3"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: uv sync --extra dev
+      - run: uv run pytest tests -q
+      - run: uv run ruff check .
+
+      # A SKIPPED TEST IS NOT A PASSING ONE.
+      - name: no test silently skipped
+        run: |
+          set -o pipefail
+          uv run pytest tests -q 2>&1 | tee /tmp/out
+          grep -qE "^[0-9]+ passed" /tmp/out
+          if grep -qE "[0-9]+ skipped" /tmp/out; then
+            echo "::error::a test skipped, CI must exercise the whole suite"
+            exit 1
+          fi
+
+      # The DAG must import in a bare interpreter. The sidecar runs it without
+      # this repo's dev group, so an import that only resolves under pytest is
+      # a failure that would otherwise surface inside Fabric.
+      - name: the DAG parses standalone
+        run: |
+          uv run --no-sync python - <<'PY'
+          import ast, pathlib
+          found = 0
+          for f in pathlib.Path("dags").rglob("*.py"):
+              ast.parse(f.read_text())
+              print("parsed", f)
+              found += 1
+          assert found, "no DAG files found, the check would pass vacuously"
+          PY
