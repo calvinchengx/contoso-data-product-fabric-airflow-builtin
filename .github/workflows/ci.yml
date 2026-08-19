@@ -45,7 +45,12 @@ jobs:
       # a failure that would otherwise surface inside Fabric.
       - name: the DAG parses standalone
         run: |
-          uv run --no-sync python -c "import ast,pathlib,sys
-for f in pathlib.Path('dags').rglob('*.py'):
-    ast.parse(f.read_text())
-    print('parsed', f)"
+          uv run --no-sync python - <<'PY'
+          import ast, pathlib
+          found = 0
+          for f in pathlib.Path("dags").rglob("*.py"):
+              ast.parse(f.read_text())
+              print("parsed", f)
+              found += 1
+          assert found, "no DAG files found, the check would pass vacuously"
+          PY
