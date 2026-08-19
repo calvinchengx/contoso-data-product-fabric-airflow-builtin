@@ -62,6 +62,13 @@ STORAGE_OPTIONS = json.loads(os.environ.get("FABRIC_STORAGE_OPTIONS", "{}"))
 # preference.
 BRONZE = Dataset("contoso://bronze/pos_customers")
 SILVER = Dataset("contoso://silver/silver_customers")
+GOLD = Dataset("contoso://gold/dim_customer")
+
+# TDS WANTS A DIFFERENT AUDIENCE. A Warehouse is Azure SQL underneath, so the
+# bearer it accepts is minted for `database.windows.net` -- handing it the
+# Fabric token fails as `audience not accepted`, which names neither audience.
+SQL_SCOPE = "https://database.windows.net/.default"
+WAREHOUSE = os.environ.get("CONTOSO_WAREHOUSE", "contoso_warehouse")
 
 # Where the vendor's bytes are staged before they reach OneLake. A scratch
 # path, not a destination: bronze lives in the Lakehouse, and a run that left
@@ -70,6 +77,8 @@ SILVER = Dataset("contoso://silver/silver_customers")
 STAGE = "/tmp/contoso-stage"
 WORKSPACE = os.environ.get("CONTOSO_WORKSPACE", "contoso-analytics")
 LAKEHOUSE = os.environ.get("CONTOSO_LAKEHOUSE", "lake")
+TDS_HOST = os.environ.get("FABRIC_TDS_HOST", "api.fabric.microsoft.com")
+TDS_PORT = os.environ.get("FABRIC_TDS_PORT", "1433")
 
 # The two audiences. A Fabric token opens the control plane; OneLake is ADLS
 # Gen2 and wants a storage token, and using one for the other fails as a 401
@@ -201,7 +210,21 @@ def contoso_slice():
                 json={"displayName": LAKEHOUSE, "type": "Lakehouse"}, timeout=120)
             made.raise_for_status()
             lakehouse = made.json()["id"]
-        return {"workspace": workspace, "lakehouse": lakehouse}
+        # THE WAREHOUSE, because gold is one. A Lakehouse holds Delta and is
+        # read by Spark; a Warehouse is T-SQL over TDS and is what gold's dbt
+        # models build into. Two items, because Fabric has two engines and the
+        # product uses both -- which is the thing this cell has to demonstrate
+        # rather than assert.
+        warehouse = next(
+            (i["id"] for i in items.json().get("value", [])
+             if i.get("displayName") == WAREHOUSE and i.get("type") == "Warehouse"), "")
+        if not warehouse:
+            made = session.post(
+                f"{api}/workspaces/{workspace}/items",
+                json={"displayName": WAREHOUSE, "type": "Warehouse"}, timeout=180)
+            made.raise_for_status()
+            warehouse = made.json()["id"]
+        return {"workspace": workspace, "lakehouse": lakehouse, "warehouse": warehouse}
 
     @task(outlets=[BRONZE])
     def to_bronze(landed: dict, where: dict) -> dict:
@@ -321,17 +344,133 @@ def contoso_slice():
             raise RuntimeError(f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
         return {"models": ["silver_customers"], "project": str(project)}
 
-    @task(outlets=[SILVER])
-    def report(bronze: dict, silver: dict) -> None:
+    @task
+    def reflect(silver: dict, where: dict) -> dict:
+        """Make silver visible to the Warehouse before gold reads it.
+
+        SILVER LIVES IN THE LAKEHOUSE; gold is a Warehouse and reaches across
+        by three-part name. The SQL analytics endpoint's view of the Lakehouse
+        is a SNAPSHOT -- tables written after it was taken do not exist as far
+        as T-SQL is concerned, and the failure is
+        `Invalid object name '<lakehouse>.lake.silver_customers'`, which reads
+        like a wrong name rather than a stale catalogue.
+
+        ASKING IS NOT THE SAME AS CONNECTING. Opening a fresh connection
+        happens to trigger a refresh on some implementations, which makes
+        "just reconnect" look like a fix and does nothing against a real
+        tenant, where this call is the only lever.
+        """
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {token(FABRIC_SCOPE)}"
+        session.verify = False
+        api = f"{FABRIC_API}/v1"
+
+        lake = session.get(
+            f"{api}/workspaces/{where['workspace']}/lakehouses/{where['lakehouse']}",
+            timeout=60)
+        lake.raise_for_status()
+        endpoint = (lake.json().get("properties", {})
+                    .get("sqlEndpointProperties", {}).get("id"))
+        if not endpoint:
+            raise RuntimeError(
+                f"lakehouse {where['lakehouse']} reports no SQL analytics endpoint; "
+                f"gold has nothing to read silver through")
+        refreshed = session.post(
+            f"{api}/workspaces/{where['workspace']}/sqlEndpoints/{endpoint}/refreshMetadata",
+            timeout=300)
+        refreshed.raise_for_status()
+        return {"endpoint": endpoint, "silver": silver["models"]}
+
+    @task(outlets=[GOLD])
+    def to_gold(seen: dict, where: dict) -> dict:
+        """Silver → gold, with THE CORE'S SQL. Not a copy of it.
+
+        `gold_dir()` is the installed package's dbt project, exactly as
+        `silver_dir()` is. Gold is where the family's numbers come from, so a
+        copy here would not merely duplicate code -- it would let this cell
+        report figures no other cell could confirm.
+
+        A WAREHOUSE, NOT A LAKEHOUSE. Fabric's Warehouse is a T-SQL engine
+        reached over TDS on 1433; Spark cannot write one. dbt-fabric talks to
+        it through `mssql-python`, which bundles the ODBC driver in the wheel
+        -- without that this cell could not run gold at all, because the
+        sidecar is Fabric's image and not one to install native drivers into.
+        """
+        import subprocess
+        import tempfile
+
+        from contoso_product import gold_dir
+
+        project = gold_dir()
+        profiles = tempfile.mkdtemp()
+        pathlib.Path(profiles, "profiles.yml").write_text(
+            "contoso_gold:\n"
+            "  target: dev\n"
+            "  outputs:\n"
+            "    dev:\n"
+            "      type: fabric\n"
+            "      driver: ODBC Driver 18 for SQL Server\n"
+            f"      server: {TDS_HOST}\n"
+            f"      port: {TDS_PORT}\n"
+            f"      database: {where['warehouse']}\n"
+            "      schema: dbo\n"
+            "      authentication: ActiveDirectoryAccessToken\n"
+            f"      access_token: {token(SQL_SCOPE)}\n"
+            "      encrypt: false\n"
+            "      trust_cert: true\n"
+            "      threads: 1\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["DBT_PROFILES_DIR"] = profiles
+        env["CONTOSO_SILVER_DATABASE"] = where["lakehouse"]
+        # NOT the lakehouse name. A Lakehouse's tables are exposed to T-SQL
+        # through its SQL analytics endpoint under `dbo`, so the three-part
+        # name gold builds is `<lakehouse-id>.dbo.silver_customers`. Setting
+        # this to the lakehouse name produced
+        # `Invalid object name '<id>.lake.silver_customers'` -- which survives
+        # a metadata refresh, because the catalogue was never stale: the name
+        # was wrong. Core already defaults this to `dbo`; overriding it was the
+        # mistake.
+        env["CONTOSO_SILVER_SCHEMA"] = "dbo"
+        # BOTH, even though one is nominally the other's default. Core's
+        # gold/models/sources.yml says
+        #   env_var('CONTOSO_SILVER_DATABASE', env_var('LAKEHOUSE_ID'))
+        # and Jinja evaluates arguments EAGERLY -- so the inner call runs
+        # whether or not the outer variable is set, and LAKEHOUSE_ID is
+        # required rather than a fallback. dbt reports it as
+        # `Env var required but not provided: 'LAKEHOUSE_ID'` while the
+        # variable that was supposed to make it unnecessary is right there.
+        # Setting both is the honest workaround; the nested default is a core
+        # defect worth fixing there.
+        env["LAKEHOUSE_ID"] = where["lakehouse"]
+        run = subprocess.run(
+            ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles,
+             "--select", "dim_customer"],
+            env=env, capture_output=True, text=True,
+        )
+        print(run.stdout[-4000:])
+        if run.returncode != 0:
+            raise RuntimeError(
+                f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
+        return {"models": ["dim_customer"], "project": str(project), "via": seen["endpoint"]}
+
+    @task
+    def report(bronze: dict, silver: dict, gold: dict) -> None:
         """State what was built, so a run says something rather than passing."""
         print(f"bronze_pos_customers: {bronze['rows']} rows, {bronze['columns']} columns")
         print(f"silver from {silver['project']}: {', '.join(silver['models'])}")
+        print(f"gold from {gold['project']}: {', '.join(gold['models'])}")
         if bronze["rows"] <= 0:
             raise RuntimeError("bronze is empty")
 
     where = provision()
     bronze = to_bronze(land(), where)
-    report(bronze, to_silver(bronze, where))
+    silver = to_silver(bronze, where)
+    # reflect BETWEEN silver and gold, not beside them: gold cannot see what
+    # the endpoint has not caught up with.
+    seen = reflect(silver, where)
+    report(bronze, silver, to_gold(seen, where))
 
 
 contoso_slice()

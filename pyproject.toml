@@ -36,6 +36,14 @@ dependencies = [
     # Sail computes. The Airflow worker holds no Spark session at any point.
     "dbt-core>=1.9,<2",
     "dbt-fabricspark>=1.9,<2",
+    # GOLD IS A WAREHOUSE, reached over TDS. dbt-fabric now uses Microsoft's
+    # `mssql-python`, which BUNDLES the ODBC Driver 18 binaries inside the
+    # wheel -- so no system-level driver install is needed in this image, on a
+    # CI runner, or on a laptop. That is what makes gold reachable from
+    # Fabric's own Airflow sidecar at all: the alternative was putting a native
+    # driver into an image this platform does not own.
+    "dbt-fabric>=1.9,<2",
+    "mssql-python>=1.0,<2",
 ]
 
 [project.optional-dependencies]
