@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import urllib.request
 
 import pendulum
 import requests
@@ -136,6 +137,11 @@ TDS_PORT = os.environ.get("FABRIC_TDS_PORT", "1433")
 # that names neither.
 FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
 STORAGE_SCOPE = "https://storage.azure.com/.default"
+
+# THE NAME compare_products.py IS GIVEN ON THE COMMAND LINE. Fixed here
+# rather than in the platform, because the product decides what it
+# publishes and the platform only decides where to put what it fetched.
+SNAPSHOT_NAME = "product_snapshot.json"
 
 
 def token(scope: str) -> str:
@@ -324,7 +330,6 @@ def contoso_slice():
 
         import pyarrow as pa
         from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
-        from deltalake import write_deltalake
 
         # Debezium's op codes. `r` is a SNAPSHOT READ and must not appear: the
         # connector is registered before any DML, so an `r` here is a finding
@@ -477,7 +482,6 @@ def contoso_slice():
         """
         import csv
         import glob
-        import io
 
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -742,13 +746,155 @@ def contoso_slice():
                 f"gold's contracts failed ({tested.returncode}):\n"
                 f"{tested.stdout[-3000:]}\n{tested.stderr[-2000:]}")
 
+        # THE VERDICTS, FROM THE RUN'S OWN ARTEFACT. Globbing `tests/*.sql`
+        # names what this project CONTAINS; run_results.json names what this
+        # invocation EVALUATED. They are the same list only when nothing went
+        # wrong, and the whole reason to publish contract names is the case
+        # where something did.
+        results = project / "target" / "run_results.json"
+        if not results.exists():
+            raise RuntimeError(
+                f"dbt test exited 0 but wrote no {results} -- refusing to "
+                f"guess whether the contracts passed.")
+        payload = json.loads(results.read_text(encoding="utf-8"))
+        # ASSERT WHICH INVOCATION WROTE IT. `dbt run` shares this target
+        # directory and overwrites the file, so it is the contracts' verdict
+        # only if `dbt test` wrote it last. The sibling platform found this the
+        # expensive way: a `run` artefact reports nine models and zero
+        # failures, which believed publishes "no contract failures" for a run
+        # where contracts failed.
+        which = (payload.get("args") or {}).get("which")
+        if which != "test":
+            raise RuntimeError(
+                f"{results} was written by `dbt {which}`, not `dbt test` -- "
+                f"refusing to report contract results from another command's "
+                f"artefact.")
+
+        evaluated, failures = set(), []
+        for r in payload.get("results", []):
+            uid = r.get("unique_id", "")
+            name = uid.split(".")[2] if uid.count(".") >= 2 else uid
+            evaluated.add(name)
+            if r.get("status") in ("pass", "success"):
+                continue
+            failures.append({"contract": name, "status": r.get("status"),
+                             "failures": r.get("failures"),
+                             "detail": (r.get("message") or "").strip()[:200]})
+
         built = sorted(p.stem for p in (project / "models").glob("*.sql"))
+        # The five named contracts, CHECKED AGAINST THE RUN. A name that is on
+        # disk but absent from run_results was not evaluated, and publishing it
+        # would let this cell appear to assert a guarantee it never tested --
+        # `compare_products` would then read agreement between a runtime that
+        # checked and one that did not.
         contracts = sorted(p.stem for p in (project / "tests").glob("*.sql"))
-        return {"models": built, "contracts": contracts,
-                "project": str(project), "via": seen["endpoint"]}
+        unevaluated = [c for c in contracts if c not in evaluated]
+        if unevaluated:
+            raise RuntimeError(
+                f"gold's tests/ names {', '.join(unevaluated)} but this "
+                f"`dbt test` evaluated no such test -- the snapshot would "
+                f"claim a guarantee that was never checked.")
+        return {"models": built, "contracts": contracts, "failures": failures,
+                "project": str(project), "via": seen["endpoint"],
+                "warehouse": where["warehouse"]}
 
     @task
-    def report(bronze: dict, silver: dict, gold: dict) -> None:
+    def snapshot(gold: dict, where: dict) -> dict:
+        """The three aggregates `compare_products.py` holds every runtime to.
+
+        THE FAMILY'S CLAIM IS NOT THAT SIX PIPELINES ARE GREEN. It is that they
+        build the same product, and only the same numbers establish that. This
+        cell ran the whole medallion and matched the family to the last decimal
+        place, and none of that counted, because the figures lived in a task
+        log that a human had to read. A number nobody can diff is a number
+        nobody checked.
+
+        DELIBERATELY THE DUMBEST POSSIBLE SQL, and deliberately NOT through
+        dbt. A comparison whose two sides share machinery proves only that the
+        machinery agrees with itself; if the adapter that built the star also
+        reported its total, an adapter bug would cancel out exactly where it
+        matters. This reads the star directly over TDS.
+        """
+        import pyodbc
+
+        raw = token(SQL_SCOPE).encode("utf-16-le")
+        dsn = ("DRIVER={ODBC Driver 18 for SQL Server};"
+               f"SERVER={TDS_HOST},{TDS_PORT};DATABASE={gold['warehouse']};"
+               "Encrypt=no;TrustServerCertificate=yes")
+        # SQL_COPT_SS_ACCESS_TOKEN. The bearer goes in as a length-prefixed
+        # UTF-16LE blob on a connection attribute, not in the DSN -- the same
+        # shape `fabric-platform-notebook-pipelines` uses, because this is its
+        # warehouse too and inventing a second way to reach it is how the last
+        # three configuration mistakes happened.
+        attrs = {1256: len(raw).to_bytes(4, "little") + raw}
+        with pyodbc.connect(dsn, attrs_before=attrs, timeout=30) as conn:
+            row = conn.cursor().execute(
+                "SELECT COALESCE(SUM(revenue_usd), 0), "
+                "COALESCE(SUM(cancelled_revenue_usd), 0), "
+                "COALESCE(SUM(sale_lines), 0) FROM dbo.fct_revenue_summary"
+            ).fetchone()
+        if row is None:
+            # "COULD NOT READ" IS NOT "ZERO". Defaulting here once published a
+            # snapshot claiming a runtime built nothing while dbt had just
+            # reported nine models built, and compare_products refused it as an
+            # empty runtime -- the right call on the evidence, the wrong
+            # diagnosis. The read was blind; the warehouse was full.
+            raise RuntimeError(
+                "gold built, but its aggregates came back with no rows -- "
+                "refusing to publish a snapshot of zeros.")
+
+        # STRINGS, NOT FLOATS. The warehouse stores money as decimal(19,4);
+        # through a JSON number the exact digits would not survive, and a
+        # precision artefact would read as two runtimes disagreeing about
+        # revenue. No cast is needed on this engine -- unlike the Databricks
+        # cell, pyodbc hands back Decimal and str() is exact.
+        snap = {
+            "revenue_usd": str(row[0]),
+            "cancelled_revenue_usd": str(row[1]),
+            "sale_lines": str(row[2]),
+            "contracts": gold["contracts"],
+            "runtime": "fabric-airflow-builtin",
+            "catalog": gold["warehouse"],
+        }
+        # ABSENT WHEN CLEAN, rather than an empty list on every green snapshot.
+        # An always-present `[]` makes "evaluated its contracts and they
+        # passed" indistinguishable from "never checked", which is the one
+        # distinction this field exists to carry.
+        if gold["failures"]:
+            snap["contract_failures"] = gold["failures"]
+
+        body = (json.dumps(snap, indent=2) + "\n").encode("utf-8")
+        # PUBLISHED TO ONELAKE, not left in the worker. The DAG runs inside
+        # Fabric's Airflow with no bind mount to anywhere a comparison could
+        # read, so the product writes its evidence to its own lakehouse and the
+        # platform fetches it. That split is the point: the product knows what
+        # it measured, the platform knows how to reach its own storage.
+        #
+        # ONE PUT, not the DFS create/append/flush dance. Measured against this
+        # emulator: `?resource=file` creates (201) but `?action=append` and
+        # `?action=flush` both answer 405 UnsupportedHttpVerb -- it serves the
+        # Blob API here. A single BlockBlob PUT round-trips, and the snapshot
+        # is a few hundred bytes, so nothing needs chunking.
+        endpoint = STORAGE_OPTIONS.get(
+            "azure_endpoint", f"https://{ONELAKE_HOST}").rstrip("/")
+        url = (f"{endpoint}/{where['workspace']}/{where['lakehouse']}"
+               f"/Files/{SNAPSHOT_NAME}")
+        request = urllib.request.Request(
+            url, data=body, method="PUT",
+            headers={"Authorization": f"Bearer {token(STORAGE_SCOPE)}",
+                     "x-ms-blob-type": "BlockBlob",
+                     "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if response.status not in (200, 201):
+                raise RuntimeError(
+                    f"publishing {SNAPSHOT_NAME} answered {response.status}")
+        print(f"gold snapshot -> {url}")
+        print(json.dumps(snap, indent=2))
+        return snap
+
+    @task
+    def report(bronze: dict, silver: dict, gold: dict, snap: dict) -> None:
         """State what was built, so a run says something rather than passing."""
         for table, meta in sorted(bronze.items()):
             print(f"{table}: {meta['rows']} rows, {meta['columns']} columns")
@@ -756,6 +902,9 @@ def contoso_slice():
         print(f"silver: {len(silver['models'])} models -- {', '.join(silver['models'])}")
         print(f"gold: {len(gold['models'])} models -- {', '.join(gold['models'])}")
         print(f"contracts: {', '.join(gold['contracts'])}")
+        print(f"revenue_usd: {snap['revenue_usd']}")
+        print(f"cancelled_revenue_usd: {snap['cancelled_revenue_usd']}")
+        print(f"sale_lines: {snap['sale_lines']}")
         if not bronze:
             raise RuntimeError("bronze is empty")
 
@@ -768,7 +917,12 @@ def contoso_slice():
     # reflect BETWEEN silver and gold, not beside them: gold cannot see what
     # the endpoint has not caught up with.
     seen = reflect(silver, where)
-    report(bronze, silver, to_gold(seen, where))
+    gold = to_gold(seen, where)
+    # THE SNAPSHOT IS PART OF THE RUN, not something a human reads out of a
+    # log afterwards. A cell whose numbers are only ever quoted by hand cannot
+    # be compared against its siblings, which is the one thing the family is
+    # for.
+    report(bronze, silver, gold, snapshot(gold, where))
 
 
 contoso_slice()

@@ -60,6 +60,12 @@ dependencies = [
     # driver into an image this platform does not own.
     "dbt-fabric>=1.9,<2",
     "mssql-python>=1.0,<2",
+    # NOT dbt's driver, and not an accident of the image. The snapshot
+    # reads the star directly rather than through the adapter that built
+    # it, so it needs its own client -- and pyodbc happened to be present
+    # here already, which is the kind of undeclared luck that survives
+    # every run until the one rebuild that drops it.
+    "pyodbc>=5.2,<6",
     # THE ERP VENDOR IS A CHANGE STREAM, so a Kafka client is the only way to
     # consume it. Reading erp.customer directly would be a snapshot -- and a
     # snapshot cannot say that a customer was in Germany before they were in

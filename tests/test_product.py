@@ -200,7 +200,8 @@ def test_the_dag_declares_every_task_the_medallion_needs():
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
     }
-    for task in ("provision", "land", "to_bronze", "to_silver", "reflect", "to_gold", "report"):
+    for task in ("provision", "land", "to_bronze", "to_silver", "reflect",
+                 "to_gold", "snapshot", "report"):
         assert task in defined, f"the DAG has lost its {task} task"
 
 
@@ -245,3 +246,58 @@ def test_gold_runs_its_contracts_rather_than_naming_them():
     """
     assert '"dbt", "test"' in DAG
     assert "gold's contracts failed" in DAG
+
+
+def test_the_run_publishes_a_snapshot_the_family_can_compare():
+    """A number nobody can diff is a number nobody checked.
+
+    This cell ran the entire medallion and matched the family to the last
+    decimal place, and none of it counted toward DoD 4, because the figures
+    only ever existed in a task log a human had to read. The comparison is the
+    point of the family; a cell that cannot be compared has not finished.
+    """
+    for key in ("revenue_usd", "cancelled_revenue_usd", "sale_lines"):
+        assert key in DAG, f"the snapshot must carry {key}"
+    assert "SNAPSHOT_NAME" in DAG
+    # Published to storage rather than left in the worker: the DAG runs inside
+    # Fabric's Airflow with no bind mount anywhere a comparison could read it.
+    assert "x-ms-blob-type" in DAG
+
+
+def test_the_snapshot_does_not_read_the_star_through_dbt():
+    """Two sides sharing machinery prove only that the machinery agrees.
+
+    If the adapter that built gold also reported gold's total, an adapter
+    defect would cancel out exactly where the family is looking. The snapshot
+    reads the star directly over TDS.
+    """
+    body = DAG[DAG.index("def snapshot("):DAG.index("def report(")]
+    assert "pyodbc" in body
+    assert "dbt" not in body, "the snapshot must not go through the adapter that built gold"
+    assert "fct_revenue_summary" in body
+
+
+def test_contract_names_come_from_the_run_not_the_filesystem():
+    """`tests/*.sql` names what the project CONTAINS, not what ran.
+
+    They are the same list only when nothing went wrong -- and the reason to
+    publish contract names at all is the case where something did. dbt shares
+    one target directory between `run` and `test`, so the artefact is the
+    contracts' verdict only if `dbt test` wrote it last.
+    """
+    assert "run_results.json" in DAG
+    assert 'which != "test"' in DAG, (
+        "a `dbt run` artefact reports zero contract failures, which believed "
+        "publishes a green snapshot for a run whose contracts failed"
+    )
+    assert "unevaluated" in DAG
+
+
+def test_an_unreadable_star_is_not_reported_as_zero():
+    """`compare_products` refuses an all-zero snapshot, so a blind read must
+    not be allowed to look like an empty warehouse.
+
+    The sibling cell published exactly that once: zeros from a read that
+    returned no rows, while dbt had just reported nine models built.
+    """
+    assert "refusing to publish a snapshot of zeros" in DAG
