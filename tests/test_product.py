@@ -93,6 +93,21 @@ def test_no_deployment_literal_is_baked_into_the_dag():
         ):
             env_keys.add(node.args[0].value)
 
+    # A DICT KEY IS A FIELD NAME, NOT A CREDENTIAL. `{"client_secret": VAR}` is
+    # the OAuth parameter every client-credentials request must send; the
+    # secret is the VALUE beside it, and here that value is a variable read
+    # from the environment. Flagging the key forbade the protocol itself.
+    #
+    # This is the distinction that makes the rule checkable: a leaked
+    # credential is a string LITERAL in value position. `{"client_secret":
+    # "hunter2"}` is still caught, because the value is a literal.
+    key_strings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    key_strings.add(key.value)
+
     docstrings = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -102,7 +117,7 @@ def test_no_deployment_literal_is_baked_into_the_dag():
     offenders = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if node.value in docstrings or node.value in env_keys:
+            if node.value in docstrings or node.value in env_keys or node.value in key_strings:
                 continue
             low = node.value.lower()
             if any(bad in low for bad in ("secret", "password", "api-key=")):

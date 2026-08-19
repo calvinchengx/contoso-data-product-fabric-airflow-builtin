@@ -49,13 +49,59 @@ FABRIC_API = os.environ.get("FABRIC_API_ROOT", "https://fabric-emulator:9443")
 ENTRA_TOKEN_URL = os.environ.get("ENTRA_TOKEN_URL", "")
 ENTRA_CLIENT_ID = os.environ.get("ENTRA_CLIENT_ID", "")
 ENTRA_CLIENT_SECRET = os.environ.get("ENTRA_CLIENT_SECRET", "")
+# The OneLake host and whatever else delta-rs needs to reach it, as DATA. The
+# sibling leaf learned this the hard way: an `if emulator:` branch here was the
+# last place the product asked which target had answered, and a deployment
+# difference expressed as a branch is one the product must be edited to change.
+ONELAKE_HOST = os.environ.get("FABRIC_ONELAKE_HOST", "onelake.dfs.fabric.microsoft.com")
+STORAGE_OPTIONS = json.loads(os.environ.get("FABRIC_STORAGE_OPTIONS", "{}"))
 
 # The one dataset this slice produces. `Dataset` rather than `Asset`: the
 # rename landed in Airflow 3 and Fabric runs 2.10.5, so this is not a
 # preference.
 BRONZE = Dataset("contoso://bronze/pos_customers")
 
-LANDING = "/opt/airflow/dags/_landing"
+# Where the vendor's bytes are staged before they reach OneLake. A scratch
+# path, not a destination: bronze lives in the Lakehouse, and a run that left
+# its only copy inside the scheduler's container would have proved nothing
+# about Fabric.
+STAGE = "/tmp/contoso-stage"
+WORKSPACE = os.environ.get("CONTOSO_WORKSPACE", "contoso-analytics")
+LAKEHOUSE = os.environ.get("CONTOSO_LAKEHOUSE", "lake")
+
+# The two audiences. A Fabric token opens the control plane; OneLake is ADLS
+# Gen2 and wants a storage token, and using one for the other fails as a 401
+# that names neither.
+FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
+STORAGE_SCOPE = "https://storage.azure.com/.default"
+
+
+def token(scope: str) -> str:
+    """A bearer, from the client-credentials flow and nothing else.
+
+    NOT AN SDK. Azure's credential chains fall through to
+    DefaultAzureCredential when they do not recognise a credential shape, and
+    unisolated that authenticates against REAL Microsoft endpoints with the
+    developer's own login. A misconfigured SDK here does not fail -- it
+    retargets production. Three lines of stdlib cannot do that.
+    """
+    import urllib.parse
+    import urllib.request
+
+    form = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": ENTRA_CLIENT_ID,
+            "client_secret": ENTRA_CLIENT_SECRET,
+            "scope": scope,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        ENTRA_TOKEN_URL, data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)["access_token"]
 
 
 @dag(
@@ -74,7 +120,7 @@ def contoso_slice():
         arrived, so a question about the vendor can be answered without going
         back to the vendor.
         """
-        os.makedirs(LANDING, exist_ok=True)
+        os.makedirs(STAGE, exist_ok=True)
         # The credential is enforced by the VENDOR. Without its fixture the
         # simulator does not fail -- it generates bodies from its OpenAPI
         # schema and answers everything 200, wrong key included -- so a run
@@ -113,18 +159,60 @@ def contoso_slice():
             # would land the right byte count and the wrong data.
             if int(response.headers["X-Page"]) != page:
                 raise RuntimeError(f"asked for page {page}, got {response.headers.get('X-Page')}")
-            path = os.path.join(LANDING, f"part-{page:04d}.csv")
+            path = os.path.join(STAGE, f"part-{page:04d}.csv")
             with open(path, "wb") as handle:
                 handle.write(response.content)
             written += len(response.content)
         return {"pages": pages, "bytes": written}
 
+    @task
+    def provision() -> dict:
+        """The workspace and Lakehouse bronze lands in.
+
+        Idempotent by name: a second run drives what the first one made. In
+        production these exist already and this task is a lookup.
+        """
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {token(FABRIC_SCOPE)}"
+        session.verify = False
+        api = f"{FABRIC_API}/v1"
+
+        listed = session.get(f"{api}/workspaces", timeout=60)
+        listed.raise_for_status()
+        workspace = next(
+            (w["id"] for w in listed.json().get("value", [])
+             if w.get("displayName") == WORKSPACE), "")
+        if not workspace:
+            made = session.post(
+                f"{api}/workspaces", json={"displayName": WORKSPACE}, timeout=60)
+            made.raise_for_status()
+            workspace = made.json()["id"]
+
+        items = session.get(f"{api}/workspaces/{workspace}/items", timeout=60)
+        items.raise_for_status()
+        lakehouse = next(
+            (i["id"] for i in items.json().get("value", [])
+             if i.get("displayName") == LAKEHOUSE and i.get("type") == "Lakehouse"), "")
+        if not lakehouse:
+            made = session.post(
+                f"{api}/workspaces/{workspace}/items",
+                json={"displayName": LAKEHOUSE, "type": "Lakehouse"}, timeout=120)
+            made.raise_for_status()
+            lakehouse = made.json()["id"]
+        return {"workspace": workspace, "lakehouse": lakehouse}
+
     @task(outlets=[BRONZE])
-    def to_bronze(landed: dict) -> dict:
-        """Landing → bronze, parsed and nothing else.
+    def to_bronze(landed: dict, where: dict) -> dict:
+        """Landing → bronze, parsed and nothing else, INTO ONELAKE.
 
         No dedupe, no conforming, no quarantine: those are silver's, and doing
         them here would destroy the only copy of what the vendor sent.
+
+        WRITTEN BY DELTA-RS DIRECTLY TO ONELAKE, with the bearer passed as a
+        storage option. That field is the reason this is delta-rs and not an
+        Azure SDK: dlt's credential model carries account-key, SAS and
+        service-principal shapes and no bearer at all, so it falls through to
+        DefaultAzureCredential and reaches real Microsoft endpoints.
         """
         import csv
         import glob
@@ -133,20 +221,29 @@ def contoso_slice():
         from deltalake import write_deltalake
 
         rows: list[dict] = []
-        for path in sorted(glob.glob(os.path.join(LANDING, "*.csv"))):
+        for path in sorted(glob.glob(os.path.join(STAGE, "*.csv"))):
             with open(path, newline="", encoding="utf-8") as handle:
                 rows.extend(csv.DictReader(handle))
         if not rows:
             raise RuntimeError(
-                f"landing at {LANDING} parsed to no rows -- the landing step "
+                f"staging at {STAGE} parsed to no rows -- the landing step "
                 f"reported {landed} and bronze read nothing, so one of them is lying"
             )
         table = pa.Table.from_pylist(rows)
-        out = os.path.join(LANDING, "_bronze_pos_customers")
-        write_deltalake(out, table, mode="overwrite")
-        with open(os.path.join(LANDING, "_bronze.json"), "w", encoding="utf-8") as handle:
-            json.dump({"rows": table.num_rows, "columns": table.num_columns}, handle)
-        return {"rows": table.num_rows, "columns": table.num_columns}
+
+        uri = (
+            f"abfss://{where['workspace']}@{ONELAKE_HOST}/"
+            f"{where['lakehouse']}/Tables/bronze_pos_customers"
+        )
+        write_deltalake(
+            uri, table, mode="overwrite",
+            storage_options={
+                "azure_storage_account_name": "onelake",
+                "azure_storage_token": token(STORAGE_SCOPE),
+                **STORAGE_OPTIONS,
+            },
+        )
+        return {"rows": table.num_rows, "columns": table.num_columns, "uri": uri}
 
     @task
     def report(bronze: dict) -> None:
@@ -155,7 +252,8 @@ def contoso_slice():
         if bronze["rows"] <= 0:
             raise RuntimeError("bronze is empty")
 
-    report(to_bronze(land()))
+    where = provision()
+    report(to_bronze(land(), where))
 
 
 contoso_slice()
