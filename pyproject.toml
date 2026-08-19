@@ -60,6 +60,15 @@ dependencies = [
     # driver into an image this platform does not own.
     "dbt-fabric>=1.9,<2",
     "mssql-python>=1.0,<2",
+    # THE ERP VENDOR IS A CHANGE STREAM, so a Kafka client is the only way to
+    # consume it. Reading erp.customer directly would be a snapshot -- and a
+    # snapshot cannot say that a customer was in Germany before they were in
+    # France, which is the whole reason this vendor is in the product.
+    "confluent-kafka>=2.5,<3",
+    # Not for ingest: the CDC step reconciles the stream's net effect against
+    # the ERP's own row count, because a connector that stopped early produces
+    # a stream that is stable, well-formed, and short.
+    "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]

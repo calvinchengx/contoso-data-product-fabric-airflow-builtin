@@ -120,6 +120,14 @@ WAREHOUSE = os.environ.get("CONTOSO_WAREHOUSE", "contoso_warehouse")
 STAGE = "/tmp/contoso-stage"
 WORKSPACE = os.environ.get("CONTOSO_WORKSPACE", "contoso-analytics")
 LAKEHOUSE = os.environ.get("CONTOSO_LAKEHOUSE", "lake")
+ERP_BROKER = os.environ.get("CONTOSO_ERP_BROKER", "contoso-erp-broker:9092")
+ERP_TOPIC = os.environ.get("CONTOSO_ERP_TOPIC", "contoso.erp.customer")
+# NO DEFAULT, because any default useful enough to connect would carry the
+# vendor's password -- and a credential in the product is a credential in every
+# clone, every reflog and every CI cache. The platform supplies this, as it
+# supplies the vendors' API keys. The repo's own test caught the first version
+# of this line, which is the test doing precisely its job.
+ERP_DSN = os.environ.get("CONTOSO_ERP_DSN", "")
 TDS_HOST = os.environ.get("FABRIC_TDS_HOST", "api.fabric.microsoft.com")
 TDS_PORT = os.environ.get("FABRIC_TDS_PORT", "1433")
 
@@ -297,8 +305,166 @@ def contoso_slice():
 
         return {"vendor": vendor["name"], "landed": landed}
 
+    @task
+    def land_erp() -> dict:
+        """Consume the ERP change stream. The fourth vendor is not an API.
+
+        THIS IS THE BOUNDARY. Postgres, Debezium and the broker are the world
+        outside the lakehouse; everything downstream is inside it. The consumer
+        is the only thing that touches both, which is exactly where a real
+        ingestion job sits.
+
+        WHAT SURVIVES AND WHAT DOES NOT. Counts survive real CDC: the same DML
+        produces the same events. LSNs, commit timestamps and Kafka offsets do
+        not, and nothing here asserts on them. `effective_date` travels as
+        DATA, which keeps the fixture's deliberate disagreement between capture
+        order and business order intact.
+        """
+        import time
+
+        import pyarrow as pa
+        from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
+        from deltalake import write_deltalake
+
+        # Debezium's op codes. `r` is a SNAPSHOT READ and must not appear: the
+        # connector is registered before any DML, so an `r` here is a finding
+        # about ordering rather than a row to quietly relabel.
+        ops = {"c": "I", "u": "U", "d": "D"}
+        columns = ["erp_customer_id", "phone", "legal_name", "account_tier", "segment",
+                   "credit_band", "account_status", "payment_terms_days", "country",
+                   "effective_date"]
+
+        consumer = Consumer({
+            "bootstrap.servers": ERP_BROKER,
+            "group.id": "contoso-erp-builtin-airflow",
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+        })
+        consumer.assign([TopicPartition(ERP_TOPIC, 0, 0)])
+
+        def watermark():
+            """The high offset, or None while the topic does not exist yet.
+
+            A MISSING TOPIC IS NOT AN ERROR, it is a vendor that has not
+            finished becoming real -- the seeder is a one-shot container and
+            compose does not wait for it. librdkafka answers
+            `_UNKNOWN_PARTITION`, which reads like a broker fault.
+            """
+            try:
+                _, high = consumer.get_watermark_offsets(
+                    TopicPartition(ERP_TOPIC, 0), timeout=30)
+            except KafkaException as exc:
+                if exc.args and getattr(exc.args[0], "code", None) == KafkaError._UNKNOWN_PARTITION:
+                    return None
+                raise
+            return high
+
+        waited = 0.0
+        while watermark() is None:
+            if waited >= 300:
+                raise RuntimeError(
+                    f"topic {ERP_TOPIC!r} does not exist after 300s -- the ERP vendor never "
+                    f"finished being seeded. The seeder registers the connector and replays "
+                    f"the history; compose does not wait for it.")
+            time.sleep(5)
+            waited += 5
+
+        # THE GATE, and never a sleep. A fixed wait passes on an idle machine,
+        # fails on a loaded one, and -- worse -- passes with a PARTIAL stream,
+        # landing a shorter file that every count stated as a minimum accepts.
+        stable, last = 0, -1
+        while stable < 3:
+            high = watermark()
+            stable = stable + 1 if high == last and high else 0
+            last = high
+            if stable < 3:
+                time.sleep(5)
+        high = last
+
+        rows = []
+        while len(rows) < high:
+            msg = consumer.poll(30.0)
+            if msg is None:
+                raise RuntimeError(f"stream stalled at {len(rows):,}/{high:,}")
+            if msg.error():
+                raise RuntimeError(str(msg.error()))
+            raw = msg.value()
+            if raw is None:
+                raise RuntimeError(
+                    f"tombstone at offset {msg.offset()} -- tombstones.on.delete drifted")
+            envelope = json.loads(raw)
+            op = envelope["op"]
+            if op not in ops:
+                raise RuntimeError(
+                    f"unexpected Debezium op {op!r} at offset {msg.offset()} -- 'r' means a "
+                    f"snapshot read, so the connector started after the DML")
+            # A delete carries its row in `before`, an insert and update in
+            # `after`. REPLICA IDENTITY FULL is what makes the delete's
+            # before-image complete; without it SCD2 cannot close the version
+            # it belonged to and the past is silently erased.
+            image = envelope["before"] if op == "d" else envelope["after"]
+            if not image:
+                raise RuntimeError(f"{op} at offset {msg.offset()} carried no row image")
+            rows.append({"op": ops[op], "capture_offset": msg.offset(),
+                         **{c: image[c] for c in columns}})
+        consumer.close()
+
+        by_op = {o: sum(1 for r in rows if r["op"] == o) for o in ("I", "U", "D")}
+        # ALL THREE, because a stream carrying only inserts is a snapshot that
+        # arrived over Kafka. Updates are what SCD2 is built from and deletes
+        # are what close a version.
+        if not all(by_op[o] > 0 for o in ("I", "U", "D")):
+            raise RuntimeError(
+                f"the stream carries {by_op} -- a change log missing an op class is a "
+                f"snapshot with extra steps")
+
+        # THE RECONCILIATION. Everything above proves the stream is well-formed
+        # and fully read; only this proves it is COMPLETE. A connector that
+        # stopped early still settles, still parses, and is simply short.
+        import psycopg
+
+        if not ERP_DSN:
+            raise RuntimeError(
+                "CONTOSO_ERP_DSN is not set. The reconciliation reads the ERP's own row "
+                "count to prove the captured stream is complete; without it this step "
+                "could only check that the stream is well-formed, which a short stream "
+                "also is.")
+        with psycopg.connect(ERP_DSN, connect_timeout=30) as conn:
+            surviving = conn.execute("SELECT count(*) FROM erp.customer").fetchone()[0]
+        net = by_op["I"] - by_op["D"]
+        if net != surviving:
+            longer = net > surviving
+            raise RuntimeError(
+                f"the captured stream implies {net:,} surviving customers "
+                f"({by_op['I']:,} inserted - {by_op['D']:,} deleted) but the ERP holds "
+                f"{surviving:,}. The stream is "
+                + ("LONGER than the source: the history has been replayed into a topic that "
+                   "still held an earlier run. The seeder truncates the TABLE, not the BROKER."
+                   if longer else
+                   "SHORT: Debezium did not capture the whole replay."))
+
+        # STAGED AS PARQUET, exactly as the HTTP vendors stage their bytes --
+        # and NOT returned through XCom. 93,571 change events would go into the
+        # metadata database as one row, which is what XCom is explicitly not
+        # for; the shape returned here is the same small manifest `land`
+        # returns, so `to_bronze` treats all four vendors identically.
+        import pyarrow.parquet as pq
+
+        table = pa.table({c: pa.array([r[c] for r in rows]) for c in rows[0]})
+        os.makedirs(os.path.join(STAGE, "bronze_erp_customer_changes"), exist_ok=True)
+        out = os.path.join(STAGE, "bronze_erp_customer_changes", "part-0001.parquet")
+        pq.write_table(table, out)
+        print(f"contoso_erp: {len(rows):,} change events "
+              f"({by_op['I']:,} I / {by_op['U']:,} U / {by_op['D']:,} D), "
+              f"reconciled against {surviving:,} surviving rows")
+        return {
+            "vendor": "contoso_erp",
+            "landed": {"bronze_erp_customer_changes": {
+                "parts": 1, "bytes": os.path.getsize(out), "ext": "parquet"}},
+        }
+
     @task(outlets=[BRONZE])
-    def to_bronze(landed: list, where: dict) -> dict:
+    def to_bronze(landed: list, erp: dict, where: dict) -> dict:
         """Landing → bronze, parsed and nothing else, into OneLake.
 
         No dedupe, no conforming, no quarantine -- those are silver's, and
@@ -323,7 +489,11 @@ def contoso_slice():
             **STORAGE_OPTIONS,
         }
         written = {}
-        for result in landed:
+        # THE CDC VENDOR JOINS THE OTHER THREE HERE. It reached the stage by a
+        # different road -- a Kafka consumer rather than an HTTP client -- and
+        # from this point it is bytes on disk like everything else, which is
+        # the property that keeps bronze one step rather than two.
+        for result in list(landed) + [erp]:
             for table, meta in result["landed"].items():
                 paths = sorted(glob.glob(os.path.join(STAGE, table, f"*.{meta['ext']}")))
                 if meta["ext"] == "parquet":
@@ -558,7 +728,7 @@ def contoso_slice():
     # ONE land TASK PER VENDOR, expanded from the declaration. Three vendors do
     # not know about each other -- which is exactly why resolving them into one
     # customer downstream is hard -- so they fan out and bronze joins them.
-    bronze = to_bronze(land.expand(vendor=VENDORS), where)
+    bronze = to_bronze(land.expand(vendor=VENDORS), land_erp(), where)
     silver = to_silver(bronze, where)
     # reflect BETWEEN silver and gold, not beside them: gold cannot see what
     # the endpoint has not caught up with.
