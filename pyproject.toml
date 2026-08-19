@@ -22,7 +22,23 @@ dependencies = [
     # against. The Airflow 3 leaf settled this and the reasoning is unchanged
     # by the Airflow version.
     "deltalake>=0.23,<2",
-    "pyarrow>=18,<24",
+    # >=23, AND THE FLOOR IS THE POINT. The reference vendor's Parquet carries
+    # SizeStatistics, and pyarrow 19 cannot read them: it raises
+    # `OSError: Repetition level histogram size mismatch` on a file whose
+    # published sha256 verifies and whose PAR1 markers are intact -- so the
+    # bytes are perfect and the reader is wrong.
+    #
+    # THE FLOOR MATTERS BECAUSE THE BASE IMAGE PRE-INSTALLS ONE. apache/airflow
+    # ships pyarrow 19.0.0, which satisfied the old `>=18` and so was left in
+    # place -- `uv pip install` upgrades nothing that already meets the
+    # constraint. Resolving this same file standalone gives 23.0.1 and works.
+    # A range that is satisfied by a version that cannot do the job is a range
+    # that expresses the wrong requirement.
+    #
+    # 23.0.1 is measured: it reads the vendor's fx_rates as 132 rows x 3
+    # columns where 19.0.0 raises on the identical bytes. Lower this if a
+    # version between is tested and works.
+    "pyarrow>=23,<24",
     # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
     # in contoso-data-product precisely so it is not copied per cell, and
     # depending on the package is the whole point of it being one. The DAG

@@ -44,8 +44,51 @@ from airflow.decorators import dag, task
 # In production these are the real vendor's hostname and a real Fabric
 # workspace; the platform supplies both, which is what makes this DAG portable
 # rather than emulator-shaped.
-POS_API = os.environ.get("CONTOSO_POS_API", "http://contoso-pos:8090")
-POS_KEY = os.environ.get("CONTOSO_POS_API_KEY", "")
+# THE VENDORS, and they agree about nothing on purpose. Three companies, three
+# credentials that rotate separately, three dialects: delimited text and JSON
+# Lines, JSON arrays with orders NESTED inside baskets, and binary Parquet.
+# Smoothing that over in the product would be inventing a tidiness the business
+# does not have -- and each awkwardness here is one a real pipeline meets.
+#
+# `digest` marks the vendor whose transport can corrupt a payload while leaving
+# it structurally valid. Parquet keeps its PAR1 markers through byte damage, so
+# only a published checksum can tell.
+VENDORS = [
+    {
+        "name": "contoso_pos",
+        "api": os.environ.get("CONTOSO_POS_API", "http://contoso-pos:8090"),
+        "key": os.environ.get("CONTOSO_POS_API_KEY", ""),
+        "paged": True,
+        "feeds": [
+            ("/api/v1/export/customers", "bronze_pos_customers", "csv"),
+            ("/api/v1/export/orders", "bronze_pos_orders", "jsonl"),
+        ],
+    },
+    {
+        "name": "contoso_web",
+        "api": os.environ.get("CONTOSO_WEB_API", "http://contoso-web:8091"),
+        "key": os.environ.get("CONTOSO_WEB_API_KEY", ""),
+        "paged": True,
+        "feeds": [
+            ("/api/v2/export/customers", "bronze_web_customers", "json"),
+            ("/api/v2/export/products", "bronze_web_products", "json"),
+            ("/api/v2/export/orders", "bronze_web_orders", "json"),
+        ],
+    },
+    {
+        "name": "contoso_reference",
+        "api": os.environ.get("CONTOSO_REFERENCE_API", "http://contoso-reference:8092"),
+        "key": os.environ.get("CONTOSO_REFERENCE_API_KEY", ""),
+        # NOT PAGED: the whole export is about four kilobytes, and a Parquet
+        # file cannot be split on line boundaries anyway.
+        "paged": False,
+        "digest": True,
+        "feeds": [
+            ("/reference/v1/product-hierarchy", "bronze_ref_product_hierarchy", "parquet"),
+            ("/reference/v1/fx-rates", "bronze_ref_fx_rates", "parquet"),
+        ],
+    },
+]
 FABRIC_API = os.environ.get("FABRIC_API_ROOT", "https://fabric-emulator:9443")
 ENTRA_TOKEN_URL = os.environ.get("ENTRA_TOKEN_URL", "")
 ENTRA_CLIENT_ID = os.environ.get("ENTRA_CLIENT_ID", "")
@@ -124,59 +167,6 @@ def token(scope: str) -> str:
 )
 def contoso_slice():
     @task
-    def land() -> dict:
-        """Pull the vendor's export and write the bytes down, unchanged.
-
-        VERBATIM, as every other cell lands it. Bronze's job is to be what
-        arrived, so a question about the vendor can be answered without going
-        back to the vendor.
-        """
-        os.makedirs(STAGE, exist_ok=True)
-        # The credential is enforced by the VENDOR. Without its fixture the
-        # simulator does not fail -- it generates bodies from its OpenAPI
-        # schema and answers everything 200, wrong key included -- so a run
-        # that skipped this check could land invented data and look fine.
-        refused = requests.get(
-            f"{POS_API}/api/v1/export/customers",
-            headers={"X-Api-Key": "wrong-key"},
-            params={"page": 1},
-            timeout=120,
-        )
-        if refused.status_code != 401:
-            raise RuntimeError(
-                f"the vendor accepted a bad API key ({refused.status_code}) -- it is "
-                f"serving generated data, not its fixture"
-            )
-
-        first = requests.get(
-            f"{POS_API}/api/v1/export/customers",
-            headers={"X-Api-Key": POS_KEY},
-            params={"page": 1},
-            timeout=600,
-        )
-        first.raise_for_status()
-        pages = int(first.headers["X-Total-Pages"])
-        written = 0
-        for page in range(1, pages + 1):
-            response = first if page == 1 else requests.get(
-                f"{POS_API}/api/v1/export/customers",
-                headers={"X-Api-Key": POS_KEY},
-                params={"page": page},
-                timeout=600,
-            )
-            response.raise_for_status()
-            # The vendor says which page this is. Checking it catches a server
-            # that ignores the parameter and returns page 1 every time, which
-            # would land the right byte count and the wrong data.
-            if int(response.headers["X-Page"]) != page:
-                raise RuntimeError(f"asked for page {page}, got {response.headers.get('X-Page')}")
-            path = os.path.join(STAGE, f"part-{page:04d}.csv")
-            with open(path, "wb") as handle:
-                handle.write(response.content)
-            written += len(response.content)
-        return {"pages": pages, "bytes": written}
-
-    @task
     def provision() -> dict:
         """The workspace and Lakehouse bronze lands in.
 
@@ -226,49 +216,148 @@ def contoso_slice():
             warehouse = made.json()["id"]
         return {"workspace": workspace, "lakehouse": lakehouse, "warehouse": warehouse}
 
+    @task
+    def land(vendor: dict) -> dict:
+        """Pull one vendor's feeds and write the bytes down, unchanged.
+
+        VERBATIM. Bronze's job is to be what arrived, so a question about the
+        vendor can be answered without going back to the vendor.
+
+        PAGED VENDORS ARE LANDED AS PARTS, not stitched back together.
+        Reassembling here would put the whole 95 MB export in this process's
+        memory -- the exact thing paging removes.
+        """
+        import hashlib
+
+        landed = {}
+        base = vendor["api"]
+        headers = {"X-Api-Key": vendor["key"]}
+
+        # THE CREDENTIAL IS THE VENDOR'S TO ENFORCE, and this proves it does.
+        # Without its fixture mokapi does not fail -- it generates bodies from
+        # the OpenAPI schema and answers everything 200, wrong key included --
+        # so a run that skipped this could land invented data and look fine.
+        probe = vendor["feeds"][0][0]
+        refused = requests.get(f"{base}{probe}", headers={"X-Api-Key": "wrong-key"},
+                               params={"page": 1} if vendor["paged"] else None, timeout=120)
+        if refused.status_code != 401:
+            raise RuntimeError(
+                f"{vendor['name']} accepted a bad API key ({refused.status_code}) -- it is "
+                f"serving generated data, not its fixture")
+
+        for path, table, ext in vendor["feeds"]:
+            os.makedirs(os.path.join(STAGE, table), exist_ok=True)
+            if not vendor["paged"]:
+                response = requests.get(f"{base}{path}", headers=headers, timeout=600)
+                response.raise_for_status()
+                body = response.content
+                if vendor.get("digest"):
+                    # PARQUET CORRUPTS QUIETLY. It keeps its PAR1 magic and
+                    # footer through byte-level damage, so a ruined file passes
+                    # every cheap check and fails much later inside a reader,
+                    # naming neither the transport nor the cause. The vendor
+                    # publishes the digest of what it sent; this is the only
+                    # check that can see the difference.
+                    published = response.headers.get("X-Content-SHA256", "")
+                    if not published:
+                        raise RuntimeError(
+                            f"{path} served no X-Content-SHA256 -- this vendor's format "
+                            f"corrupts silently, so an unverifiable body is not usable")
+                    got = hashlib.sha256(body).hexdigest()
+                    if got != published:
+                        raise RuntimeError(
+                            f"{path} arrived corrupted: vendor sent {published}, "
+                            f"{len(body):,} bytes hash to {got}")
+                    if body[:4] != b"PAR1" or body[-4:] != b"PAR1":
+                        raise RuntimeError(f"{path} is not Parquet: {body[:4]!r}..{body[-4:]!r}")
+                with open(os.path.join(STAGE, table, f"part-0001.{ext}"), "wb") as fh:
+                    fh.write(body)
+                landed[table] = {"parts": 1, "bytes": len(body), "ext": ext}
+                continue
+
+            first = requests.get(f"{base}{path}", headers=headers,
+                                 params={"page": 1}, timeout=600)
+            first.raise_for_status()
+            pages = int(first.headers["X-Total-Pages"])
+            total = 0
+            for page in range(1, pages + 1):
+                response = first if page == 1 else requests.get(
+                    f"{base}{path}", headers=headers, params={"page": page}, timeout=600)
+                response.raise_for_status()
+                # The vendor says which page this is. Checking it catches a
+                # server that ignores the parameter and returns page 1 every
+                # time -- the right byte count and the wrong data.
+                if int(response.headers["X-Page"]) != page:
+                    raise RuntimeError(
+                        f"{path}: asked page {page}, got {response.headers.get('X-Page')}")
+                with open(os.path.join(STAGE, table, f"part-{page:04d}.{ext}"), "wb") as fh:
+                    fh.write(response.content)
+                total += len(response.content)
+            landed[table] = {"parts": pages, "bytes": total, "ext": ext}
+
+        return {"vendor": vendor["name"], "landed": landed}
+
     @task(outlets=[BRONZE])
-    def to_bronze(landed: dict, where: dict) -> dict:
-        """Landing → bronze, parsed and nothing else, INTO ONELAKE.
+    def to_bronze(landed: list, where: dict) -> dict:
+        """Landing → bronze, parsed and nothing else, into OneLake.
 
-        No dedupe, no conforming, no quarantine: those are silver's, and doing
-        them here would destroy the only copy of what the vendor sent.
+        No dedupe, no conforming, no quarantine -- those are silver's, and
+        doing them here would destroy the only copy of what the vendor sent.
 
-        WRITTEN BY DELTA-RS DIRECTLY TO ONELAKE, with the bearer passed as a
-        storage option. That field is the reason this is delta-rs and not an
-        Azure SDK: dlt's credential model carries account-key, SAS and
-        service-principal shapes and no bearer at all, so it falls through to
-        DefaultAzureCredential and reaches real Microsoft endpoints.
+        THREE DIALECTS, THREE READERS, and none of them reshapes. Web's orders
+        stay NESTED: an order carries its own `lines` array because a
+        storefront thinks in baskets, and flattening is a decision that belongs
+        downstream where it is visible.
         """
         import csv
         import glob
+        import io
 
         import pyarrow as pa
+        import pyarrow.parquet as pq
         from deltalake import write_deltalake
 
-        rows: list[dict] = []
-        for path in sorted(glob.glob(os.path.join(STAGE, "*.csv"))):
-            with open(path, newline="", encoding="utf-8") as handle:
-                rows.extend(csv.DictReader(handle))
-        if not rows:
-            raise RuntimeError(
-                f"staging at {STAGE} parsed to no rows -- the landing step "
-                f"reported {landed} and bronze read nothing, so one of them is lying"
-            )
-        table = pa.Table.from_pylist(rows)
+        options = {
+            "azure_storage_account_name": "onelake",
+            "azure_storage_token": token(STORAGE_SCOPE),
+            **STORAGE_OPTIONS,
+        }
+        written = {}
+        for result in landed:
+            for table, meta in result["landed"].items():
+                paths = sorted(glob.glob(os.path.join(STAGE, table, f"*.{meta['ext']}")))
+                if meta["ext"] == "parquet":
+                    tbl = pa.concat_tables([pq.read_table(p) for p in paths])
+                elif meta["ext"] == "csv":
+                    rows = []
+                    for path in paths:
+                        with open(path, newline="", encoding="utf-8") as fh:
+                            rows.extend(csv.DictReader(fh))
+                    tbl = pa.Table.from_pylist(rows)
+                elif meta["ext"] == "jsonl":
+                    rows = []
+                    for path in paths:
+                        with open(path, encoding="utf-8") as fh:
+                            rows.extend(json.loads(line) for line in fh if line.strip())
+                    tbl = pa.Table.from_pylist(rows)
+                else:  # json arrays, one self-contained array per page
+                    rows = []
+                    for path in paths:
+                        with open(path, encoding="utf-8") as fh:
+                            body = json.load(fh)
+                        rows.extend(body if isinstance(body, list) else [body])
+                    tbl = pa.Table.from_pylist(rows)
 
-        uri = (
-            f"abfss://{where['workspace']}@{ONELAKE_HOST}/"
-            f"{where['lakehouse']}/Tables/bronze_pos_customers"
-        )
-        write_deltalake(
-            uri, table, mode="overwrite",
-            storage_options={
-                "azure_storage_account_name": "onelake",
-                "azure_storage_token": token(STORAGE_SCOPE),
-                **STORAGE_OPTIONS,
-            },
-        )
-        return {"rows": table.num_rows, "columns": table.num_columns, "uri": uri}
+                if tbl.num_rows == 0:
+                    raise RuntimeError(
+                        f"{table} parsed to no rows from {len(paths)} part(s) -- landing "
+                        f"reported {meta}, so one of them is lying")
+                uri = (f"abfss://{where['workspace']}@{ONELAKE_HOST}/"
+                       f"{where['lakehouse']}/Tables/{table}")
+                write_deltalake(uri, tbl, mode="overwrite", storage_options=options)
+                written[table] = {"rows": tbl.num_rows, "columns": tbl.num_columns}
+                print(f"{table}: {tbl.num_rows} rows, {tbl.num_columns} columns")
+        return written
 
     @task
     def to_silver(bronze: dict, where: dict) -> dict:
@@ -458,14 +547,18 @@ def contoso_slice():
     @task
     def report(bronze: dict, silver: dict, gold: dict) -> None:
         """State what was built, so a run says something rather than passing."""
-        print(f"bronze_pos_customers: {bronze['rows']} rows, {bronze['columns']} columns")
+        for table, meta in sorted(bronze.items()):
+            print(f"{table}: {meta['rows']} rows, {meta['columns']} columns")
         print(f"silver from {silver['project']}: {', '.join(silver['models'])}")
         print(f"gold from {gold['project']}: {', '.join(gold['models'])}")
-        if bronze["rows"] <= 0:
+        if not bronze:
             raise RuntimeError("bronze is empty")
 
     where = provision()
-    bronze = to_bronze(land(), where)
+    # ONE land TASK PER VENDOR, expanded from the declaration. Three vendors do
+    # not know about each other -- which is exactly why resolving them into one
+    # customer downstream is hard -- so they fan out and bronze joins them.
+    bronze = to_bronze(land.expand(vendor=VENDORS), where)
     silver = to_silver(bronze, where)
     # reflect BETWEEN silver and gold, not beside them: gold cannot see what
     # the endpoint has not caught up with.

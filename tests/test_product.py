@@ -181,3 +181,41 @@ def test_the_dbt_profile_is_written_from_the_environment():
     never require."""
     assert "profiles.yml" in DAG
     assert "where['workspace']" in DAG and "where['lakehouse']" in DAG
+
+
+def test_the_dag_declares_every_task_the_medallion_needs():
+    """The task SET, asserted -- because nothing else here checks it.
+
+    While widening this DAG a text edit silently deleted `provision` and
+    `to_silver`: the replaced span ran from one function to another and the two
+    in between went with it. Every existing test still passed, because they
+    checked idioms and imports rather than the graph. A DAG missing a task is
+    not a syntax error -- it parses, it runs, and it quietly does less.
+    """
+    import ast
+
+    tree = ast.parse(SOURCE)
+    defined = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    for task in ("provision", "land", "to_bronze", "to_silver", "reflect", "to_gold", "report"):
+        assert task in defined, f"the DAG has lost its {task} task"
+
+
+def test_every_vendor_is_landed_and_none_is_hard_coded():
+    """Three vendors, each with its own credential and its own dialect.
+
+    A key that worked across vendors would prove nothing about any of them:
+    these are separate companies whose credentials rotate separately, which is
+    what having three vendors means rather than three routes on one.
+    """
+    assert "VENDORS = [" in DAG
+    for vendor in ("contoso_pos", "contoso_web", "contoso_reference"):
+        assert vendor in DAG, vendor
+    assert "land.expand(vendor=VENDORS)" in DAG, "vendors must fan out, not be listed by hand"
+    # The reference vendor's transport corrupts silently; only its published
+    # digest can tell, so the check has to be there.
+    assert "X-Content-SHA256" in DAG
+    assert "PAR1" in DAG

@@ -412,7 +412,7 @@ requires-dist = [
     { name = "dbt-fabricspark", specifier = ">=1.9,<2" },
     { name = "deltalake", specifier = ">=0.23,<2" },
     { name = "mssql-python", specifier = ">=1.0,<2" },
-    { name = "pyarrow", specifier = ">=18,<24" },
+    { name = "pyarrow", specifier = ">=23,<24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3,<10" },
     { name = "requests", specifier = ">=2.32,<3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14,<0.16" },
