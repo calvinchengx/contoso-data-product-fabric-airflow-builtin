@@ -1,0 +1,33 @@
+[project]
+name = "contoso-data-product-fabric-airflow-builtin"
+version = "0.1.0"
+description = "The Contoso data product for Fabric's built-in Apache Airflow (ApacheAirflowJob)"
+requires-python = ">=3.12"
+authors = [{name = "Calvin Cheng", email = "calvin@calvinx.com"}]
+
+# WHAT THE BUILT-IN AIRFLOW MUST IMPORT. The platform installs exactly this
+# into the sidecar, the same way fabric-platform-airflow3 builds its worker
+# from the product's pyproject.toml -- a product declares its dependencies and
+# a platform provides them.
+#
+# On REAL Fabric this is the "install private package as requirement" feature
+# of an Apache Airflow job. The emulator has no equivalent yet -- it syncs .py
+# files and nothing else -- so the platform bakes them into the sidecar image
+# instead. Same outcome, different mechanism, and the difference is recorded
+# rather than hidden (fabric-emulator#323).
+dependencies = [
+    "requests>=2.32,<3",
+    # Bronze is written by delta-rs, not Spark: an Airflow worker has no Spark
+    # session, and this is the writer the emulator is already witnessed
+    # against. The Airflow 3 leaf settled this and the reasoning is unchanged
+    # by the Airflow version.
+    "deltalake>=0.23,<2",
+    "pyarrow>=18,<24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
