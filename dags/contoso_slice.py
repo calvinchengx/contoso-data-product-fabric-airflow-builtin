@@ -592,16 +592,31 @@ def contoso_slice():
             # core's default under a running pipeline.
             "DBT_PROFILES_DIR": profiles,
         })
+        # EVERY MODEL, and no --select. dbt's own graph decides the order,
+        # which is the reason for pointing it at a project rather than issuing
+        # statements: silver_party reads silver_customers and
+        # silver_web_customers, and stating that order here would be a second
+        # place for the graph to live.
+        #
+        # The bronze names go in as vars because the cells genuinely disagree
+        # about what bronze is called -- core declares them as vars precisely
+        # so a platform can say. This cell writes the vendor-prefixed names, so
+        # these are identities; a cell whose bronze predates the convention
+        # maps them here instead of renaming tables under a running pipeline.
         run = subprocess.run(
             ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles,
-             "--select", "silver_customers",
-             "--vars", json.dumps({"bronze_pos_customers": "bronze_pos_customers"})],
+             "--vars", json.dumps({name: name for name in (
+                 "bronze_pos_customers", "bronze_pos_orders",
+                 "bronze_web_customers", "bronze_web_orders", "bronze_web_products",
+                 "bronze_ref_product_hierarchy", "bronze_ref_fx_rates",
+                 "bronze_erp_customer_changes")})],
             env=env, capture_output=True, text=True,
         )
         print(run.stdout[-4000:])
         if run.returncode != 0:
             raise RuntimeError(f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
-        return {"models": ["silver_customers"], "project": str(project)}
+        built = sorted(p.stem for p in (project / "models").glob("*.sql"))
+        return {"models": built, "project": str(project)}
 
     @task
     def reflect(silver: dict, where: dict) -> dict:
@@ -704,15 +719,33 @@ def contoso_slice():
         # defect worth fixing there.
         env["LAKEHOUSE_ID"] = where["lakehouse"]
         run = subprocess.run(
-            ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles,
-             "--select", "dim_customer"],
+            ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles],
             env=env, capture_output=True, text=True,
         )
         print(run.stdout[-4000:])
         if run.returncode != 0:
             raise RuntimeError(
                 f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
-        return {"models": ["dim_customer"], "project": str(project), "via": seen["endpoint"]}
+
+        # THE CONTRACTS, ACTUALLY RUN. Publishing a list of guarantees this
+        # runtime never evaluated is worse than publishing none: another cell's
+        # snapshot names the same five, and comparing the two would say they
+        # agree when only one of them checked. `dbt test` is what makes the
+        # names mean something here.
+        tested = subprocess.run(
+            ["dbt", "test", "--project-dir", str(project), "--profiles-dir", profiles],
+            env=env, capture_output=True, text=True,
+        )
+        print(tested.stdout[-4000:])
+        if tested.returncode != 0:
+            raise RuntimeError(
+                f"gold's contracts failed ({tested.returncode}):\n"
+                f"{tested.stdout[-3000:]}\n{tested.stderr[-2000:]}")
+
+        built = sorted(p.stem for p in (project / "models").glob("*.sql"))
+        contracts = sorted(p.stem for p in (project / "tests").glob("*.sql"))
+        return {"models": built, "contracts": contracts,
+                "project": str(project), "via": seen["endpoint"]}
 
     @task
     def report(bronze: dict, silver: dict, gold: dict) -> None:
@@ -720,7 +753,9 @@ def contoso_slice():
         for table, meta in sorted(bronze.items()):
             print(f"{table}: {meta['rows']} rows, {meta['columns']} columns")
         print(f"silver from {silver['project']}: {', '.join(silver['models'])}")
-        print(f"gold from {gold['project']}: {', '.join(gold['models'])}")
+        print(f"silver: {len(silver['models'])} models -- {', '.join(silver['models'])}")
+        print(f"gold: {len(gold['models'])} models -- {', '.join(gold['models'])}")
+        print(f"contracts: {', '.join(gold['contracts'])}")
         if not bronze:
             raise RuntimeError("bronze is empty")
 

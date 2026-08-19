@@ -219,3 +219,29 @@ def test_every_vendor_is_landed_and_none_is_hard_coded():
     # digest can tell, so the check has to be there.
     assert "X-Content-SHA256" in DAG
     assert "PAR1" in DAG
+
+
+def test_no_model_selector_narrows_the_medallion():
+    """Every model, and dbt's own graph decides the order.
+
+    A `--select` was right while this was a slice and is wrong now: it would
+    silently build a subset while the run still reports success, and the
+    numbers would simply be smaller. The graph lives in the dbt project --
+    silver_party reads silver_customers and silver_web_customers -- so
+    restating any part of it here would be a second place for it to live.
+    """
+    assert "--select" not in DAG, (
+        "a model selector narrows the build; the whole medallion is the point"
+    )
+
+
+def test_gold_runs_its_contracts_rather_than_naming_them():
+    """A snapshot listing contracts this runtime never evaluated is worse than
+    one listing none.
+
+    Another cell's snapshot names the same five, so comparing the two would
+    report agreement when only one of them checked. `dbt test` is what makes
+    the names mean something here, and a failure has to fail the task.
+    """
+    assert '"dbt", "test"' in DAG
+    assert "gold's contracts failed" in DAG
