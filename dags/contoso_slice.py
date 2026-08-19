@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 
 import pendulum
 import requests
@@ -60,6 +61,7 @@ STORAGE_OPTIONS = json.loads(os.environ.get("FABRIC_STORAGE_OPTIONS", "{}"))
 # rename landed in Airflow 3 and Fabric runs 2.10.5, so this is not a
 # preference.
 BRONZE = Dataset("contoso://bronze/pos_customers")
+SILVER = Dataset("contoso://silver/silver_customers")
 
 # Where the vendor's bytes are staged before they reach OneLake. A scratch
 # path, not a destination: bronze lives in the Lakehouse, and a run that left
@@ -246,14 +248,90 @@ def contoso_slice():
         return {"rows": table.num_rows, "columns": table.num_columns, "uri": uri}
 
     @task
-    def report(bronze: dict) -> None:
+    def to_silver(bronze: dict, where: dict) -> dict:
+        """Bronze → silver, with THE CORE'S MODELS. Not a copy of them.
+
+        `silver_dir()` is a path inside the installed `contoso-data-product`
+        package. dbt is pointed at it; nothing is vendored into this repo and
+        nothing here restates a transform. If a model changes in core, this
+        cell gets it by moving a tag -- which is the only way "one product,
+        many orchestrators" is a fact rather than a slogan.
+
+        SUBMITTED OVER LIVY. dbt-fabricspark talks to Fabric's Livy surface,
+        the emulator terminates it, and the engine computes. This worker holds
+        no Spark session -- an Airflow worker does not have one, which is the
+        constraint that decided the whole architecture.
+        """
+        import subprocess
+        import tempfile
+
+        from contoso_product import silver_dir
+
+        project = silver_dir()
+        profiles = tempfile.mkdtemp()
+        # The profile is DEPLOYMENT, so it is written here from the
+        # environment rather than shipped: pointing dbt at a different
+        # workspace must not mean editing the product.
+        # THE ADAPTER'S OWN REQUIRED SHAPE, taken from the sibling leaf's
+        # working profile rather than invented. A first attempt omitted
+        # `livy_mode`, `authentication` and spelled the bearer `token` instead
+        # of `accessToken`; dbt rejected it inside mashumaro's generated
+        # deserialiser, which names the file and none of the missing fields.
+        pathlib.Path(profiles, "profiles.yml").write_text(
+            "contoso_silver:\n"
+            "  target: dev\n"
+            "  outputs:\n"
+            "    dev:\n"
+            "      type: fabricspark\n"
+            "      method: livy\n"
+            "      livy_mode: fabric\n"
+            "      authentication: int_tests\n"
+            f"      accessToken: {token(FABRIC_SCOPE)}\n"
+            f"      endpoint: {FABRIC_API}/v1\n"
+            f"      workspaceid: {where['workspace']}\n"
+            f"      lakehouseid: {where['lakehouse']}\n"
+            f"      lakehouse: {LAKEHOUSE}\n"
+            f"      schema: {LAKEHOUSE}\n"
+            "      threads: 1\n"
+            "      connect_retries: 3\n"
+            "      connect_timeout: 30\n"
+            "      spark_config:\n"
+            "        name: contoso-silver\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env.update({
+            "DBT_BRONZE_SCHEMA": LAKEHOUSE,
+            "DBT_SILVER_LOCATION_ROOT":
+                f"abfss://{where['workspace']}@{ONELAKE_HOST}/{where['lakehouse']}/Tables",
+            # THE PLATFORM'S BRONZE NAMES. Core declares these as vars because
+            # the cells genuinely disagree about what bronze is called; this
+            # cell writes one table and names it here rather than renaming the
+            # core's default under a running pipeline.
+            "DBT_PROFILES_DIR": profiles,
+        })
+        run = subprocess.run(
+            ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles,
+             "--select", "silver_customers",
+             "--vars", json.dumps({"bronze_pos_customers": "bronze_pos_customers"})],
+            env=env, capture_output=True, text=True,
+        )
+        print(run.stdout[-4000:])
+        if run.returncode != 0:
+            raise RuntimeError(f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
+        return {"models": ["silver_customers"], "project": str(project)}
+
+    @task(outlets=[SILVER])
+    def report(bronze: dict, silver: dict) -> None:
         """State what was built, so a run says something rather than passing."""
         print(f"bronze_pos_customers: {bronze['rows']} rows, {bronze['columns']} columns")
+        print(f"silver from {silver['project']}: {', '.join(silver['models'])}")
         if bronze["rows"] <= 0:
             raise RuntimeError("bronze is empty")
 
     where = provision()
-    report(to_bronze(land(), where))
+    bronze = to_bronze(land(), where)
+    report(bronze, to_silver(bronze, where))
 
 
 contoso_slice()

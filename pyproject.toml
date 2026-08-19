@@ -23,10 +23,37 @@ dependencies = [
     # by the Airflow version.
     "deltalake>=0.23,<2",
     "pyarrow>=18,<24",
+    # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
+    # in contoso-data-product precisely so it is not copied per cell, and
+    # depending on the package is the whole point of it being one. The DAG
+    # resolves it with `silver_dir()` at run time and points dbt there.
+    #
+    # This is the line that would be easiest to omit while copying the models
+    # in instead -- and doing so is the defect the entire family is built to
+    # prevent, in the one place a rewrite makes it tempting.
+    "contoso-data-product",
+    # SILVER LANDS IN THE LAKEHOUSE over Livy: the emulator terminates it and
+    # Sail computes. The Airflow worker holds no Spark session at any point.
+    "dbt-core>=1.9,<2",
+    "dbt-fabricspark>=1.9,<2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
+
+[tool.uv.sources]
+# THE PUBLISHED WHEEL, not a git tag and not a sibling path.
+#
+# Not a path, because a path resolves only from a checkout that happens to have
+# both repos side by side and the sidecar image receives this product's
+# directory and nothing else.
+#
+# Not a git tag either, and that is measured rather than preferred: the Airflow
+# image has no `git`, so uv fails the build with "Git executable not found".
+# Installing git to fetch a package that is already published as a wheel would
+# be adding a build dependency to work around not using the artifact. A release
+# wheel is also what production pins.
+contoso-data-product = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.2.0/contoso_data_product-0.2.0-py3-none-any.whl" }
 
 [tool.ruff]
 line-length = 100

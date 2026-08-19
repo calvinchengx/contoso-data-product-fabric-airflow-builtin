@@ -149,3 +149,35 @@ def test_the_slice_declares_what_it_produces():
     acquiring one later."""
     assert "outlets=[BRONZE]" in DAG
     assert 'Dataset("contoso://bronze/pos_customers")' in DAG
+
+
+def test_silver_comes_from_the_core_and_is_not_restated_here():
+    """The models are `silver_dir()`'s, resolved at run time.
+
+    THE ONE RULE THIS CELL IS MOST LIKELY TO BREAK. Widening a DAG to silver
+    means rewriting orchestration, and copying the models in while you are
+    there is the path of least resistance -- it would work, it would pass, and
+    it would end "one product, many orchestrators" quietly. So the check is
+    structural: this repo must contain no dbt project of its own, and the DAG
+    must resolve the core's.
+    """
+    assert "from contoso_product import silver_dir" in DAG
+    assert "silver_dir()" in DAG
+    stray = [
+        str(p.relative_to(ROOT))
+        for p in ROOT.rglob("*.sql")
+        if ".venv" not in p.parts
+    ] + [
+        str(p.relative_to(ROOT))
+        for p in ROOT.rglob("dbt_project.yml")
+        if ".venv" not in p.parts
+    ]
+    assert stray == [], f"a transform was copied into this leaf: {stray}"
+
+
+def test_the_dbt_profile_is_written_from_the_environment():
+    """A profile is DEPLOYMENT. Shipping one would mean editing the product to
+    point it at a different workspace, which is what a portable product must
+    never require."""
+    assert "profiles.yml" in DAG
+    assert "where['workspace']" in DAG and "where['lakehouse']" in DAG
