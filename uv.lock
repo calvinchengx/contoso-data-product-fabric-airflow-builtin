@@ -396,10 +396,10 @@ wheels = [
 
 [[package]]
 name = "contoso-data-product"
-version = "0.2.0"
-source = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.2.0/contoso_data_product-0.2.0-py3-none-any.whl" }
+version = "0.3.0"
+source = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.3.0/contoso_data_product-0.3.0-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.2.0/contoso_data_product-0.2.0-py3-none-any.whl", hash = "sha256:9c68512a8b7784944b34da68630fdd2e68dc84b7c977a8abd130e05a6ad7acfe" },
+    { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.3.0/contoso_data_product-0.3.0-py3-none-any.whl", hash = "sha256:ff3b0881df14053b0be63689c61dd7c14d36425dc576744368bf2bf7a76fccc3" },
 ]
 
 [package.metadata]
@@ -433,7 +433,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "confluent-kafka", specifier = ">=2.5,<3" },
-    { name = "contoso-data-product", url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.2.0/contoso_data_product-0.2.0-py3-none-any.whl" },
+    { name = "contoso-data-product", url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.3.0/contoso_data_product-0.3.0-py3-none-any.whl" },
     { name = "dbt-core", specifier = ">=1.9,<2" },
     { name = "dbt-fabric", specifier = ">=1.9,<2" },
     { name = "dbt-fabricspark", specifier = ">=1.9,<2" },

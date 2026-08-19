@@ -92,7 +92,7 @@ dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
 # Installing git to fetch a package that is already published as a wheel would
 # be adding a build dependency to work around not using the artifact. A release
 # wheel is also what production pins.
-contoso-data-product = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.2.0/contoso_data_product-0.2.0-py3-none-any.whl" }
+contoso-data-product = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.3.0/contoso_data_product-0.3.0-py3-none-any.whl" }
 
 [tool.ruff]
 line-length = 100
