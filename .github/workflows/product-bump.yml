@@ -1,0 +1,75 @@
+# The bump a leaf raises for itself. Copy into a leaf as
+# `.github/workflows/product-bump.yml`.
+#
+# WHY THE LEAF AND NOT THE CORE. Pushing into seven repositories needs a token
+# with write on all seven: one secret to create, over-scope, and eventually let
+# expire, and when it expires all seven stop at once and nothing says so. A leaf
+# editing its OWN pyproject.toml needs only the `GITHUB_TOKEN` its workflow
+# already has, so there is no secret at all and a failure is one leaf's problem.
+#
+# A deploy key cannot do this job either way: it authenticates git over SSH to
+# one repository and has no REST API access, so it can push a branch and not
+# open a pull request.
+#
+# THIS DOES NOT REPLACE `--check-pin`. That is what makes a stale pin FAIL, in
+# this repository's own CI, and it is the guarantee. This is the convenience
+# that means somebody rarely has to act on it.
+name: Product bump
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      # A GIT URL, not a bare name. This package is published as a GitHub
+      # release wheel and is not on PyPI, so `--with contoso-data-product`
+      # fails with `not found in the package registry`. Caught by running the
+      # template's own command before deploying it to seven repositories.
+      # `--update-pin` exits non-zero when there is nothing to do, so a day with
+      # no release ends here rather than opening an empty pull request.
+      - id: bump
+        continue-on-error: true
+        run: uv run --no-project --with "contoso-data-product @ git+https://github.com/calvinchengx/contoso-data-product" python -m contoso_product.show --update-pin pyproject.toml
+      - if: steps.bump.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(uv run --no-project --with "contoso-data-product @ git+https://github.com/calvinchengx/contoso-data-product" \
+            python -c "from contoso_product import show; print(show.latest_release())")
+          branch="chore/product-v$version"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          # THE LOCK AND THE README TOO. A bump that moves only the pin leaves
+          # `uv.lock` resolving the old wheel and the README inventory listing
+          # the old models, so the PR would fail this repository's own checks
+          # and read as the bump being wrong rather than incomplete.
+          uv lock
+          uv run python -m contoso_product.show --markdown > /tmp/block.md
+          uv run --no-project python - <<'PY'
+          import pathlib
+          block = pathlib.Path("/tmp/block.md").read_text().strip()
+          readme = pathlib.Path("README.md")
+          text = readme.read_text(encoding="utf-8")
+          start = text.index("<!-- BEGIN product inventory")
+          end = text.index("<!-- END product inventory -->") + len("<!-- END product inventory -->")
+          readme.write_text(text[:start] + block + text[end:], encoding="utf-8")
+          PY
+          git commit -qam "chore: contoso-data-product v$version"
+          git push -q origin "$branch"
+          gh pr create --fill --base "${{ github.event.repository.default_branch }}" \
+            --title "chore: contoso-data-product v$version" \
+            --body "The core released v$version, and every leaf tracks one version with no exception, so the product cannot mean different things in different cells.
+
+          Raised by this repository's own scheduled workflow using \`GITHUB_TOKEN\`: no cross-repository secret is involved. The pin, \`uv.lock\` and the README inventory move together, because moving only the pin would fail this repository's own checks and read as the bump being wrong rather than incomplete."
