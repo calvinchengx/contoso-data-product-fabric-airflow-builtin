@@ -80,6 +80,24 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
 
+[tool.uv]
+# sqlparse reaches this lock only through dbt-core, which declares
+# `sqlparse<0.6.0,>=0.5.5`. Four advisories (three DoS, one escaping) name
+# 0.6.0 as the first patched version, so there is no dbt release to upgrade
+# INTO: the choice is this override or living with them. A constraint cannot
+# do it -- nothing satisfies `<0.6.0` and `>=0.6.0` at once -- so the
+# maintainer's upper bound has to be overridden.
+#
+# FIVE SIBLING LEAVES ALREADY CARRY THIS and this one did not, which is why it
+# was the only repository in the family showing open Dependabot alerts. The
+# override is measured rather than assumed: fabric-emulator established that
+# dbt touches sqlparse in exactly one module and its output is byte-identical
+# under 0.5.5 and 0.6.0, and it landed here behind a full witness run.
+#
+# Remove it the moment dbt-core allows 0.6.0 itself; an override that outlives
+# its reason silently pins a dependency nobody is watching.
+override-dependencies = ["sqlparse>=0.6.0"]
+
 [tool.uv.sources]
 # THE PUBLISHED WHEEL, not a git tag and not a sibling path.
 #
