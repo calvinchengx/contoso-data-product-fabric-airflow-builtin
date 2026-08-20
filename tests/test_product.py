@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = (ROOT / "dags" / "contoso_slice.py").read_text(encoding="utf-8")
@@ -163,16 +164,20 @@ def test_silver_comes_from_the_core_and_is_not_restated_here():
     """
     assert "from contoso_product import silver_dir" in DAG
     assert "silver_dir()" in DAG
-    stray = [
-        str(p.relative_to(ROOT))
-        for p in ROOT.rglob("*.sql")
-        if ".venv" not in p.parts
-    ] + [
-        str(p.relative_to(ROOT))
-        for p in ROOT.rglob("dbt_project.yml")
-        if ".venv" not in p.parts
-    ]
-    assert stray == [], f"a transform was copied into this leaf: {stray}"
+    # TRACKED files, not whatever is on disk. `make show-product` stages the
+    # core's dbt projects into `product/` so a reader can open the SQL without
+    # cloning the core, and a filesystem scan cannot tell that apart from a
+    # vendored fork -- it flagged all 29 staged files the first time.
+    #
+    # Asking git is the sharper question anyway. A staged copy is gitignored and
+    # regenerated on every `make show-product`, so it cannot drift from the
+    # core; a COMMITTED copy is a fork by definition, and that is exactly what
+    # this rule is here to stop.
+    tracked = subprocess.run(
+        ["git", "ls-files", "*.sql", "dbt_project.yml", "**/dbt_project.yml"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert tracked == [], f"a transform was committed into this leaf: {tracked}"
 
 
 def test_the_dbt_profile_is_written_from_the_environment():
@@ -301,3 +306,21 @@ def test_an_unreadable_star_is_not_reported_as_zero():
     returned no rows, while dbt had just reported nine models built.
     """
     assert "refusing to publish a snapshot of zeros" in DAG
+
+
+def test_the_readme_inventory_matches_the_pinned_core():
+    """The README's product list must be what this leaf's pin actually contains.
+
+    A generated list that falls behind is worse than none: a reader trusts it
+    BECAUSE it looks generated. The check lives in the core, so all seven leaves
+    ask the same question of their own pin, and it fails here, in the repository
+    that has to fix it.
+
+    Regenerate with:  python -m contoso_product.show --markdown
+    """
+    from pathlib import Path
+
+    from contoso_product import show
+
+    ok, message = show.check(Path(__file__).resolve().parent.parent / "README.md")
+    assert ok, message
