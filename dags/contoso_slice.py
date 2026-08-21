@@ -701,7 +701,12 @@ def contoso_slice():
         )
         env = dict(os.environ)
         env["DBT_PROFILES_DIR"] = profiles
-        env["CONTOSO_SILVER_DATABASE"] = where["lakehouse"]
+        # DBT_-PREFIXED SINCE CORE v0.6.0. Snowflake's dbt Projects refuse any
+        # env var key that is not UPPERCASE and DBT_-prefixed, so the name this
+        # used to set could not be supplied there at all -- gold ran on every
+        # engine in this family except the one named for running dbt as a
+        # first-class object.
+        env["DBT_SILVER_DATABASE"] = where["lakehouse"]
         # NOT the lakehouse name. A Lakehouse's tables are exposed to T-SQL
         # through its SQL analytics endpoint under `dbo`, so the three-part
         # name gold builds is `<lakehouse-id>.dbo.silver_customers`. Setting
@@ -710,18 +715,18 @@ def contoso_slice():
         # a metadata refresh, because the catalogue was never stale: the name
         # was wrong. Core already defaults this to `dbo`; overriding it was the
         # mistake.
-        env["CONTOSO_SILVER_SCHEMA"] = "dbo"
-        # BOTH, even though one is nominally the other's default. Core's
-        # gold/models/sources.yml says
+        env["DBT_SILVER_SCHEMA"] = "dbo"
+        # THE CORE DEFECT WAS FIXED, so the workaround is gone. This used to set
+        # LAKEHOUSE_ID as well, because gold said
         #   env_var('CONTOSO_SILVER_DATABASE', env_var('LAKEHOUSE_ID'))
-        # and Jinja evaluates arguments EAGERLY -- so the inner call runs
-        # whether or not the outer variable is set, and LAKEHOUSE_ID is
-        # required rather than a fallback. dbt reports it as
-        # `Env var required but not provided: 'LAKEHOUSE_ID'` while the
-        # variable that was supposed to make it unnecessary is right there.
-        # Setting both is the honest workaround; the nested default is a core
-        # defect worth fixing there.
-        env["LAKEHOUSE_ID"] = where["lakehouse"]
+        # and Jinja evaluates arguments EAGERLY -- so the inner call ran whether
+        # or not the outer variable was set, and dbt reported
+        # `Env var required but not provided: 'LAKEHOUSE_ID'` while the variable
+        # meant to make it unnecessary sat right there. The comment here called
+        # it "a core defect worth fixing there", and v0.6.0 fixed it: the nested
+        # default is gone and nothing reads LAKEHOUSE_ID for dbt any more.
+        # Fabric's own LAKEHOUSE_ID, which notebookutils reads, is a different
+        # thing and untouched.
         run = subprocess.run(
             ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles],
             env=env, capture_output=True, text=True,
