@@ -1,0 +1,65 @@
+# CodeQL -- advanced (in-repo) setup.
+#
+# THIS REPOSITORY WAS NOT SCANNED. It is one of the family's seven leaves: the
+# data product as the engine's built-in Airflow runs it on Fabric. The bar for a leaf is lower
+# than for the wheel every leaf installs -- these are demonstrations, not
+# artefacts anybody deploys -- but the medallion models and the contract checks
+# live here, and they are the code the family's cross-runtime comparison trusts.
+#
+# See G51 in contoso-data-product/docs/01-plan.md: the emulators were scanned
+# and the products and platforms were not. That gap is not hypothetical. The
+# only reason three real defects were found in fabric-emulator and three more in
+# snowflake-emulator is that both are scanned -- including a `DROP STAGE ..`
+# that reached os.RemoveAll on the stage directory's parent. Nothing here is
+# known to be wrong; nobody has looked, and that is the difference this closes.
+#
+# Two languages, because that is what this repository contains: python and actions.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '31 7 * * 1' # weekly, Monday 07:31 UTC
+
+# Superseding a PR run is free. Superseding a main run is NOT: a cancelled
+# CodeQL job still uploads its SARIF, flagged `unsuccessful execution` with zero
+# results, and that errored analysis becomes the newest one for its category.
+# A sibling lost 11 of its first 43 main runs that way. So main runs to
+# completion; only PR pushes cancel.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    # Explicit, because GitHub's 6-hour default makes a wedged run read as
+    # 'still pending' rather than failing.
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false # one language's failure must not hide the others
+      matrix:
+        language: [python, actions]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          # `none`: nothing here is built in CI, so there is no build to observe.
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4.37.7
+        with:
+          category: '/language:${{ matrix.language }}'
