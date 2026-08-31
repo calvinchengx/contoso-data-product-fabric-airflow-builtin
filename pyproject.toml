@@ -38,7 +38,7 @@ dependencies = [
     # 23.0.1 is measured: it reads the vendor's fx_rates as 132 rows x 3
     # columns where 19.0.0 raises on the identical bytes. Lower this if a
     # version between is tested and works.
-    "pyarrow>=23,<24",
+    "pyarrow>=23,<26",
     # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
     # in contoso-data-product precisely so it is not copied per cell, and
     # depending on the package is the whole point of it being one. The DAG
@@ -78,7 +78,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.16"]
+dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.17"]
 
 [tool.uv.sources]
 # THE PUBLISHED WHEEL, not a git tag and not a sibling path.
