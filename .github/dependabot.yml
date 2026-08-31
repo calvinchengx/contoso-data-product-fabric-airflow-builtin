@@ -1,0 +1,37 @@
+version: 2
+
+# THIS FILE'S ABSENCE IS WHY THE RED SAT FOR 13 DAYS. Dependabot ran here
+# anyway -- security updates need no config -- so the repository received
+# automated updates nobody had configured, and when one failed there was no
+# version-update schedule to produce a later green and no owner watching. The
+# failing job was `uv in /. for sqlparse`, a security update that could not
+# resolve because the dbt-core it had to keep pinned sqlparse below the patched
+# release.
+#
+# Declaring the ecosystems does two things: updates arrive grouped and weekly
+# instead of one PR per transitive package, and a resolution failure shows up
+# again the following week rather than staying the last word.
+updates:
+  # Python, uv-managed: one lockfile at the root. Dependabot reads
+  # pyproject.toml and uv.lock together.
+  #
+  # GROUPED, because this lock is nearly all transitive dbt and Airflow
+  # dependencies. Ungrouped it opens a PR per package and the one bump that
+  # matters is indistinguishable from forty that do not.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ['*']
