@@ -614,7 +614,7 @@ def contoso_slice():
                  "bronze_web_customers", "bronze_web_orders", "bronze_web_products",
                  "bronze_ref_product_hierarchy", "bronze_ref_fx_rates",
                  "bronze_erp_customer_changes")})],
-            env=env, capture_output=True, text=True,
+            env=env, capture_output=True, text=True, check=False,
         )
         print(run.stdout[-4000:])
         if run.returncode != 0:
@@ -729,7 +729,7 @@ def contoso_slice():
         # thing and untouched.
         run = subprocess.run(
             ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles],
-            env=env, capture_output=True, text=True,
+            env=env, capture_output=True, text=True, check=False,
         )
         print(run.stdout[-4000:])
         if run.returncode != 0:
@@ -743,7 +743,7 @@ def contoso_slice():
         # names mean something here.
         tested = subprocess.run(
             ["dbt", "test", "--project-dir", str(project), "--profiles-dir", profiles],
-            env=env, capture_output=True, text=True,
+            env=env, capture_output=True, text=True, check=False,
         )
         print(tested.stdout[-4000:])
         if tested.returncode != 0:
