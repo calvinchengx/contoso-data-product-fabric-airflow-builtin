@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import subprocess
 import urllib.request
 
 import pendulum
@@ -171,6 +172,53 @@ def token(scope: str) -> str:
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)["access_token"]
 
+
+
+# The emulator's own words when a statement failed for a reason it already
+# repaired. spark_agent/session_recovery.py restarts the engine to refresh its
+# Storage credential, which discards session state, then re-registers the
+# lakehouse tables and says so -- ending with "This statement did not run;
+# re-run it."
+#
+# NOTHING IN THIS FAMILY LISTENED. A recoverable, self-announced condition
+# arrived as a fatal build failure: `silver_party` died on
+# `TABLE_OR_VIEW_NOT_FOUND: silver_customers` with the recovery note attached,
+# after seven of eight models had already built.
+RECOVERED = "[recovered]"
+
+
+def dbt(argv, env, what):
+    """Run dbt, and retry ONCE if the engine says the statement never ran.
+
+    KEYED ON THE MARKER, NOT ON FAILURE. A blanket retry -- an Airflow
+    `retries=1`, or catching every non-zero -- would also re-run genuine model
+    errors, turning a deterministic failure into a flaky one. That is strictly
+    worse than the failure it hides: a wrong model would pass on a second
+    attempt often enough to look intermittent and never be fixed. Only the
+    emulator's own `[recovered]` note earns a second attempt.
+
+    ONCE, not until it works. The restart is a credential refresh, so a
+    genuinely broken session repeats rather than resolves, and a loop would
+    turn a five-minute failure into a timeout.
+
+    The re-run is safe because dbt table materialization is idempotent and the
+    project is re-run whole, so dbt's own graph re-resolves the order rather
+    than this code guessing which models still need building.
+    """
+    run = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+    print(run.stdout[-4000:])
+    if run.returncode != 0 and RECOVERED in run.stdout:
+        # SAID OUT LOUD. A silent retry would make the recovery invisible in
+        # the log, and the next person to read a passing run would have no
+        # idea the engine had restarted underneath it.
+        print(f"{what}: the engine restarted and re-registered its tables; "
+              f"dbt reported the statement never ran, so this is attempt 2 of 2.")
+        run = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+        print(run.stdout[-4000:])
+    if run.returncode != 0:
+        raise RuntimeError(
+            f"{what} failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
+    return run
 
 @dag(
     dag_id="contoso_slice",
@@ -548,7 +596,6 @@ def contoso_slice():
         no Spark session -- an Airflow worker does not have one, which is the
         constraint that decided the whole architecture.
         """
-        import subprocess
         import tempfile
 
         from contoso_product import silver_dir
@@ -618,18 +665,14 @@ def contoso_slice():
         # so a platform can say. This cell writes the vendor-prefixed names, so
         # these are identities; a cell whose bronze predates the convention
         # maps them here instead of renaming tables under a running pipeline.
-        run = subprocess.run(
+        dbt(
             ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles,
              "--vars", json.dumps({name: name for name in (
                  "bronze_pos_customers", "bronze_pos_orders",
                  "bronze_web_customers", "bronze_web_orders", "bronze_web_products",
                  "bronze_ref_product_hierarchy", "bronze_ref_fx_rates",
                  "bronze_erp_customer_changes")})],
-            env=env, capture_output=True, text=True, check=False,
-        )
-        print(run.stdout[-4000:])
-        if run.returncode != 0:
-            raise RuntimeError(f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
+            env, "silver dbt run")
         built = sorted(p.stem for p in (project / "models").glob("*.sql"))
         return {"models": built, "project": str(project)}
 
@@ -685,7 +728,6 @@ def contoso_slice():
         -- without that this cell could not run gold at all, because the
         sidecar is Fabric's image and not one to install native drivers into.
         """
-        import subprocess
         import tempfile
 
         from contoso_product import gold_dir
@@ -738,14 +780,8 @@ def contoso_slice():
         # default is gone and nothing reads LAKEHOUSE_ID for dbt any more.
         # Fabric's own LAKEHOUSE_ID, which notebookutils reads, is a different
         # thing and untouched.
-        run = subprocess.run(
-            ["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles],
-            env=env, capture_output=True, text=True, check=False,
-        )
-        print(run.stdout[-4000:])
-        if run.returncode != 0:
-            raise RuntimeError(
-                f"dbt run failed ({run.returncode}):\n{run.stdout[-3000:]}\n{run.stderr[-2000:]}")
+        dbt(["dbt", "run", "--project-dir", str(project), "--profiles-dir", profiles],
+            env, "gold dbt run")
 
         # THE CONTRACTS, ACTUALLY RUN. Publishing a list of guarantees this
         # runtime never evaluated is worse than publishing none: another cell's
