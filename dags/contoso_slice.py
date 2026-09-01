@@ -578,7 +578,18 @@ def contoso_slice():
             f"      lakehouseid: {where['lakehouse']}\n"
             f"      lakehouse: {LAKEHOUSE}\n"
             f"      schema: {LAKEHOUSE}\n"
-            "      threads: 1\n"
+            # FOUR, not one. Seven of core's eight silver models depend only on
+            # sources -- only silver_party refs another -- so dbt can build
+            # seven at once, and the emulator does not serialise them: it
+            # terminates Livy itself and each statement reaches Sail
+            # independently. Measured on fabric-emulator's
+            # medallion-dbt-fabricspark example, same adapter and engine: at 1
+            # the models START 26s and 15s apart and the step takes 96.0s; at 4
+            # they start in the SAME SECOND and it takes 45.5s. Carried over
+            # from where it was measured rather than tuned here -- this graph
+            # admits seven, so the ceiling is untested. The gold profile below
+            # keeps threads: 1, being a different adapter over TDS.
+            "      threads: 4\n"
             "      connect_retries: 3\n"
             "      connect_timeout: 30\n"
             "      spark_config:\n"
