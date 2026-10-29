@@ -38,12 +38,12 @@ dependencies = [
     # 23.0.1 is measured: it reads the vendor's fx_rates as 132 rows x 3
     # columns where 19.0.0 raises on the identical bytes. Lower this if a
     # version between is tested and works.
-    "pyarrow>=23,<26",
-    # AND NUMPY 2 WITH IT. pyarrow 25 is built against NumPy 2 and refuses
-    # to import on 1.x ("pyarrow requires NumPy 2.0 or newer, found
-    # 1.26.4"), which is what the Airflow base image pre-installs. numpy
-    # was never declared here, so nothing upgraded it; pyarrow 23 tolerated
-    # the old one and the bump to 25 made the gap real.
+    "pyarrow>=23,<27",
+    # AND NUMPY 2 WITH IT. pyarrow 25 and later are built against NumPy 2
+    # and refuse to import on 1.x ("pyarrow requires NumPy 2.0 or newer,
+    # found 1.26.4"), which is what the Airflow base image pre-installs.
+    # numpy was never declared here, so nothing upgraded it; pyarrow 23
+    # tolerated the old one and the bump made the gap real.
     "numpy>=2,<3",
     # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
     # in contoso-data-product precisely so it is not copied per cell, and
@@ -84,7 +84,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.17"]
+dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.18"]
 
 [tool.uv.sources]
 # THE PUBLISHED WHEEL, not a git tag and not a sibling path.
@@ -98,7 +98,7 @@ dev = ["pytest>=9.0.3,<10", "ruff>=0.14,<0.17"]
 # Installing git to fetch a package that is already published as a wheel would
 # be adding a build dependency to work around not using the artifact. A release
 # wheel is also what production pins.
-contoso-data-product = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.6.0/contoso_data_product-0.6.0-py3-none-any.whl" }
+contoso-data-product = { url = "https://github.com/calvinchengx/contoso-data-product/releases/download/v0.6.2/contoso_data_product-0.6.2-py3-none-any.whl" }
 
 [tool.ruff]
 line-length = 100
