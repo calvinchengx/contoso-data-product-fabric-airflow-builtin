@@ -45,6 +45,12 @@ dependencies = [
     # numpy was never declared here, so nothing upgraded it; pyarrow 23
     # tolerated the old one and the bump made the gap real.
     "numpy>=2,<3",
+    # PANDAS TOO, FOR THE SAME REASON AND FROM THE SAME PLACE. The Airflow
+    # base image ships a pandas built against NumPy 1.x; with NumPy 2 in the
+    # environment it fails at import with "numpy.dtype size changed, may
+    # indicate binary incompatibility. Expected 96 from C header, got 88".
+    # Declaring the floor makes uv upgrade it to a NumPy-2 build.
+    "pandas>=2.2,<4",
     # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
     # in contoso-data-product precisely so it is not copied per cell, and
     # depending on the package is the whole point of it being one. The DAG
