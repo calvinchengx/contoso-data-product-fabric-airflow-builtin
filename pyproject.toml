@@ -39,6 +39,12 @@ dependencies = [
     # columns where 19.0.0 raises on the identical bytes. Lower this if a
     # version between is tested and works.
     "pyarrow>=23,<27",
+    # AND NUMPY 2 WITH IT. pyarrow 25 and later are built against NumPy 2
+    # and refuse to import on 1.x ("pyarrow requires NumPy 2.0 or newer,
+    # found 1.26.4"), which is what the Airflow base image pre-installs.
+    # numpy was never declared here, so nothing upgraded it; pyarrow 23
+    # tolerated the old one and the bump made the gap real.
+    "numpy>=2,<3",
     # SILVER'S MODELS COME FROM HERE, not from this repo. The dbt project lives
     # in contoso-data-product precisely so it is not copied per cell, and
     # depending on the package is the whole point of it being one. The DAG
